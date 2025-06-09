@@ -22,7 +22,6 @@ class ShopifyFields
             'label' => 'shopify::app.shopify.fields.description',
             'types' => [
                 'textarea',
-                'text',
             ],
             'tooltip' => 'supported attributes types: text, textarea',
         ], [
@@ -66,7 +65,7 @@ class ShopifyFields
             'label' => 'shopify::app.shopify.fields.vendor',
             'types' => [
                 'text',
-                'select',
+                'simpleselect',
             ],
             'tooltip' => 'supported attributes types: text, simple select',
         ], [
@@ -83,17 +82,15 @@ class ShopifyFields
             'types' => [
                 'text',
                 'select',
-                'textarea',
-                'multiselect',
             ],
-            'tooltip' => 'supported attributes types: textarea, text, select, multiselect',
+            'tooltip' => 'supported attributes types: textarea, text, price, date, metric, select, multiselect, number, yes/no, identifier',
         ], [
             'name'  => 'barcode',
             'label' => 'shopify::app.shopify.fields.barcode',
             'types' => [
                 'text',
             ],
-            'tooltip' => 'supported attributes types: text',
+            'tooltip' => 'supported attributes types: text, number',
 
         ], [
             'name'  => 'compareAtPrice',
@@ -122,7 +119,7 @@ class ShopifyFields
             'types' => [
                 'text',
             ],
-            'tooltip' => 'supported attributes types: text',
+            'tooltip' => 'supported attributes types: text, identifier',
         ], [
             'name'  => 'taxable',
             'label' => 'shopify::app.shopify.fields.taxable',

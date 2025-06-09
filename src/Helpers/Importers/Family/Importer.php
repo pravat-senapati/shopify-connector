@@ -17,13 +17,15 @@ use Webkul\Shopify\Repositories\ShopifyCredentialRepository;
 use Webkul\Shopify\Repositories\ShopifyExportMappingRepository;
 use Webkul\Shopify\Traits\DataMappingTrait;
 use Webkul\Shopify\Traits\ShopifyGraphqlRequest;
+use Webkul\Shopify\Traits\ValidatedBatched;
 
 class Importer extends AbstractImporter
 {
     use DataMappingTrait;
     use ShopifyGraphqlRequest;
+    use ValidatedBatched;
 
-    public const BATCH_SIZE = 10;
+    public const BATCH_SIZE = 100;
 
     public const UNOPIM_ENTITY_NAME = 'familyCount';
 
@@ -139,7 +141,6 @@ class Importer extends AbstractImporter
         $cursor = null;
         $allFamily = [];
         $formattedOption = [];
-        $optionWithVariant = [];
         do {
             $variables = [];
             $mutationType = 'productGettingOptions';
@@ -157,8 +158,7 @@ class Importer extends AbstractImporter
                 ? $graphResponse['body']['data']['products']['edges']
                 : [];
 
-            $formattedOption = $this->formatedAttributeAndOption($graphqlOption, $optionWithVariant);
-            $optionWithVariant = array_unique($optionWithVariant);
+            $formattedOption = $this->formatedAttributeAndOption($graphqlOption);
 
             $allFamily = array_merge($allFamily, $formattedOption);
             $lastCursor = ! empty($graphqlOption) ? end($graphqlOption)['cursor'] : null;
@@ -169,26 +169,26 @@ class Importer extends AbstractImporter
             $cursor = $lastCursor;
 
         } while (! empty($graphqlOption));
-        $simpleproductFamily = $this->familymodifyforsimpleProduct($allFamily, $optionWithVariant);
+
+        $simpleproductFamily = $this->familymodifyforsimpleProduct($allFamily);
 
         return $allFamily;
     }
 
-    public function familymodifyforsimpleProduct($family, $optionWithVariant)
+    public function familymodifyforsimpleProduct($family)
     {
         $importMapping = $this->importMapping->mapping ? $this->importMapping->mapping['shopify_connector_settings'] : [];
-        $imagesAttr = $this->importMapping->mapping['mediaMapping'] ?? null;
-
+        $imagesAttr = $importMapping['images'] ?? null;
         $allImageAttr = [];
         if ($imagesAttr) {
-            $allImageAttr = explode(',', $imagesAttr['mediaAttributes']);
+            $allImageAttr = explode(',', $imagesAttr);
         }
-
         $simpleProductFamilyId = $importMapping['family_variant'] ?? null;
         unset($importMapping['family_variant']);
-        $metaFieldAllAttr = array_merge($optionWithVariant, array_unique($this->defintiionMapping), array_values($importMapping), $allImageAttr);
+        $metaFieldAllAttr = array_merge(array_column($family, 'code'), array_unique($this->defintiionMapping), array_values($importMapping), $allImageAttr);
         $metaFieldAllAttr[] = 'sku';
         $metaFieldAttrIds = $this->attributeRepository->whereIn('code', $metaFieldAllAttr)->pluck('id')->toArray();
+
         if ($simpleProductFamilyId) {
             $familyModel = $this->attributeFamilyRepository->find($simpleProductFamilyId);
             if (! $familyModel) {
@@ -232,12 +232,13 @@ class Importer extends AbstractImporter
                 DB::table('attribute_group_mappings')->insertOrIgnore($data);
             }
         }
+
     }
 
     /**
      * Formated family of attributes
      */
-    public function formatedAttributeAndOption(array $options, &$optionWithVariant): array
+    public function formatedAttributeAndOption(array $options): array
     {
         $family = [];
         $family_codes = [];
@@ -253,7 +254,6 @@ class Importer extends AbstractImporter
                 continue;
             }
             $lowercaseArray = array_map('strtolower', $optionName);
-            $optionWithVariant = array_merge($lowercaseArray, $optionWithVariant);
             $importMappingAttr = $this->importMapping->mapping ? $this->importMapping->mapping['shopify_connector_settings'] : [];
 
             $imageMappingAttr = $importMappingAttr['images'] ?? '';
@@ -268,7 +268,7 @@ class Importer extends AbstractImporter
             $family_code = preg_replace(['/,/', '/[^a-zA-Z0-9_]/'], ['_', ''], json_encode($lowercaseArray));
             $allAttrForFamily[] = 'sku';
             $allAttrForFamily[] = 'status';
-            $allAttrForFamily = array_filter(array_unique($allAttrForFamily));
+            $allAttrForFamily = array_unique($allAttrForFamily);
             foreach ($allAttrForFamily as $key => $attrCode) {
                 $attributeModel = $this->attributeRepository->findOneByField('code', $attrCode);
                 if (! $attributeModel) {
@@ -301,55 +301,6 @@ class Importer extends AbstractImporter
     public function validateData(): void
     {
         $this->saveValidatedBatches();
-    }
-
-    /**
-     * Save validated batches
-     */
-    protected function saveValidatedBatches(): self
-    {
-        $source = $this->getSource();
-
-        $batchRows = [];
-
-        $source->rewind();
-        /**
-         * Clean previous saved batches
-         */
-        $this->importBatchRepository->deleteWhere([
-            'job_track_id' => $this->import->id,
-        ]);
-
-        while (
-            $source->valid()
-            || count($batchRows)
-        ) {
-            if (
-                count($batchRows) == self::BATCH_SIZE
-                || ! $source->valid()
-            ) {
-                $this->importBatchRepository->create([
-                    'job_track_id' => $this->import->id,
-                    'data'         => $batchRows,
-                ]);
-
-                $batchRows = [];
-            }
-
-            if ($source->valid()) {
-                $rowData = $source->current();
-
-                if ($this->validateRow($rowData, 1)) {
-                    $batchRows[] = $this->prepareRowForDb($rowData);
-                }
-
-                $this->processedRowsCount++;
-
-                $source->next();
-            }
-        }
-
-        return $this;
     }
 
     /**

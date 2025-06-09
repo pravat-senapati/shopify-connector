@@ -2,6 +2,7 @@
 
 namespace Webkul\Shopify\Helpers\Importers\Product;
 
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Http;
 use Webkul\Attribute\Repositories\AttributeFamilyRepository;
 use Webkul\Attribute\Repositories\AttributeRepository;
@@ -15,7 +16,6 @@ use Webkul\DataTransfer\Helpers\Importers\FieldProcessor;
 use Webkul\DataTransfer\Helpers\Importers\Product\SKUStorage;
 use Webkul\DataTransfer\Repositories\JobTrackBatchRepository;
 use Webkul\Product\Repositories\ProductRepository;
-use Webkul\Shopify\Helpers\ShoifyMetaFieldType;
 use Webkul\Shopify\Repositories\ShopifyCredentialRepository;
 use Webkul\Shopify\Repositories\ShopifyExportMappingRepository;
 use Webkul\Shopify\Repositories\ShopifyMappingRepository;
@@ -29,9 +29,13 @@ class Importer extends AbstractImporter
     use ShopifyGraphqlRequest;
     use ValidatedBatched;
 
-    public const BATCH_SIZE = 50;
+    public const BATCH_SIZE = 100;
 
     public const UNOPIM_ENTITY_NAME = 'product';
+
+    public const CONFIGURABLE = 'configurable';
+
+    public const SIMPLE = 'simple';
 
     /**
      * Cached attribute families
@@ -89,7 +93,7 @@ class Importer extends AbstractImporter
 
     protected $importMapping;
 
-    protected $defintiionMapping;
+    protected $definitionMapping;
 
     /**
      * Shopify credential as array for api request.
@@ -99,11 +103,6 @@ class Importer extends AbstractImporter
     protected $credentialArray;
 
     protected $exportMapping;
-
-    /**
-     * Shopify metafield type data.
-     */
-    protected $shoifyMetaFieldTypeData;
 
     /**
      * Valid csv columns
@@ -146,7 +145,6 @@ class Importer extends AbstractImporter
         protected FileStorer $fileStorer,
         protected CategoryRepository $categoryRepository,
         protected ShopifyMappingRepository $shopifyMappingRepository,
-        protected ShoifyMetaFieldType $shoifyMetaFieldType,
     ) {
         parent::__construct($importBatchRepository);
 
@@ -160,7 +158,7 @@ class Importer extends AbstractImporter
     {
         $this->attributeFamilies = $this->attributeFamilyRepository->all();
 
-        $this->attributes = $this->attributeRepository->all()->keyBy('code');
+        $this->attributes = $this->attributeRepository->all();
 
         $this->importMapping = $this->shopifyExportmapping->find(3);
 
@@ -223,8 +221,6 @@ class Importer extends AbstractImporter
     {
         $filters = $this->import->jobInstance->filters;
 
-        $this->shoifyMetaFieldTypeData = $this->shoifyMetaFieldType->getMetaFieldTypeInShopify();
-
         $this->credential = $this->shopifyRepository->find($filters['credentials'] ?? null);
         if (! $this->credential?->active) {
             throw new \InvalidArgumentException('Invalid Credential: The credential is either disabled, incorrect, or does not exist');
@@ -235,7 +231,7 @@ class Importer extends AbstractImporter
 
         $this->currency = $filters['currency'] ?? null;
 
-        $this->defintiionMapping = array_merge(array_keys($this->credential?->extras['productMetafield'] ?? []), array_keys($this->credential?->extras['productVariantMetafield'] ?? []));
+        $this->definitionMapping = array_merge(array_keys($this->credential?->extras['productMetafield'] ?? []), array_keys($this->credential?->extras['productVariantMetafield'] ?? []));
     }
 
     /**
@@ -256,9 +252,45 @@ class Importer extends AbstractImporter
             'apiVersion'  => $this->credential?->apiVersion,
         ];
 
-        $products = new \Webkul\Shopify\Helpers\Iterator\ProductIterator($this->credentialArray);
+        $products = new \ArrayIterator($this->getProductsByCursor());
 
         return $products;
+    }
+
+    /**
+     * Get product data from shopify API
+     */
+    public function getProductsByCursor(): array
+    {
+        $cursor = null;
+        $allProducts = [];
+        do {
+            $mutationType = 'productAllvalueGetting';
+            $variable = [];
+            if ($cursor) {
+                $variable = [
+                    'first'       => 10,
+                    'afterCursor' => $cursor,
+                ];
+                $mutationType = 'productAllvalueGettingByCursor';
+            }
+            $graphResponse = $this->requestGraphQlApiAction($mutationType, $this->credentialArray, $variable);
+
+            $graphqlProducts = ! empty($graphResponse['body']['data']['products']['edges'])
+                ? $graphResponse['body']['data']['products']['edges']
+                : [];
+            $allProducts = array_merge($allProducts, $graphqlProducts);
+
+            $lastCursor = ! empty($graphqlProducts) ? end($graphqlProducts)['cursor'] : null;
+
+            if ($cursor === $lastCursor || empty($lastCursor)) {
+                break;
+            }
+
+            $cursor = $lastCursor;
+        } while (! empty($graphqlProducts));
+
+        return $allProducts;
     }
 
     /**
@@ -285,78 +317,59 @@ class Importer extends AbstractImporter
     protected function saveProductsData(JobTrackBatchContract $batch): bool
     {
         $this->initFilters();
-        // dd($batch->data);
         foreach ($batch->data as $rowData) {
-            $productId = $rowData['node']['id'];
-            $isRemainingVariant = $rowData['node']['variants']['pageInfo']['hasNextPage'] ?? false;
-            $variants = $rowData['node']['variants']['edges'];
-            if ($isRemainingVariant) {
-                $lastVariant = end($rowData['node']['variants']['edges']);
-                $cursorVariant = $lastVariant['cursor'];
-                $variables = [
-                    'productId' => $productId,
-                    'after'     => $cursorVariant,
-                ];
-
-                $this->credentialArray = [
-                    'shopUrl'     => $this->credential?->shopUrl,
-                    'accessToken' => $this->credential?->accessToken,
-                    'apiVersion'  => $this->credential?->apiVersion,
-                ];
-
-                $data = $this->requestGraphQlApiAction('gettingRemaingVariant', $this->credentialArray, $variables);
-                $remainData = $data['body']['data']['product']['variants']['edges'];
-                $variants = array_merge($variants, $remainData);
-            }
-
             $unopimCategory = $this->getCollectionFromShopify($rowData['node']['collections']['edges'] ?? []);
             $productImages = $rowData['node']['images']['edges'];
             $productMedias = $rowData['node']['media']['nodes'];
 
             $imageMediaids = array_column(array_filter($productMedias, fn ($item) => $item['__typename'] === 'MediaImage'), 'id') ?? [];
+
             $image = [];
-            $image = array_map(fn ($productImage) => $productImage['node']['originalSrc'], $productImages);
+            $image = array_map(fn ($productImage) => $this->imageStorer($productImage['node']['originalSrc']), $productImages);
+            $variants = $rowData['node']['variants']['edges'];
+
             $count = 0;
             $count = count(array_filter($rowData['node']['options'], fn ($option) => $option['name'] !== 'Title' || ! in_array('Default Title', $option['values'])));
 
             $mappingAttr = $this->importMapping->mapping['shopify_connector_settings'] ?? [];
-            $mediaMapping = $this->importMapping->mapping['mediaMapping'] ?? [];
             $simpleProductFamilyId = $mappingAttr['family_variant'] ?? null;
 
             if (! $simpleProductFamilyId) {
                 continue;
             }
 
-            $metaFieldAllAttr = $this->defintiionMapping ?? [];
+            $metaFieldAllAttr = $this->definitionMapping ?? [];
 
             unset($mappingAttr['family_variant']);
+            $variantImageAttr = $mappingAttr['variantimages'] ?? null;
             $extractProductAttr = array_intersect_key($mappingAttr, array_flip($this->productIndexes));
             $extractSeoAttr = array_intersect_key($mappingAttr, array_flip($this->seoFields));
             $extractVariantAttr = array_intersect_key($mappingAttr, array_flip($this->variantIndexes));
             $common = [];
-            $channel_specific = [];
-            $locale_specific = [];
+            $channelSpecific = [];
+            $localeSpecific = [];
             $channelAndLocaleSpecific = [];
-            $productModelattribiteUnopim = $this->mapAttributes($extractProductAttr, $rowData, false);
+            $productModelattributeUnopim = $this->mapAttributes($extractProductAttr, $rowData, false);
 
             $seoAttrUnopim = $this->mapAttributes($extractSeoAttr, $rowData, true);
 
-            if (! $productModelattribiteUnopim || ! $seoAttrUnopim) {
+            if (! $productModelattributeUnopim || ! $seoAttrUnopim) {
                 continue;
             }
 
-            [$pcommon, $plocale_specific, $pchannel_specific, $pchannelAndLocaleSpecific] = $productModelattribiteUnopim;
+            [$productCommon, $productLocaleSpecific, $productChannelSpecific, $productChannelAndLocaleSpecific] = $productModelattributeUnopim;
 
-            [$scommon, $slocale_specific, $schannel_specific, $schannelAndLocaleSpecific] = $seoAttrUnopim;
+            [$seoCommon, $seoLocaleSpecific, $seoChannelSpecific, $seoChannelAndLocaleSpecific] = $seoAttrUnopim;
 
-            [$mdcommon, $mdlocale_specific, $mdchannel_specific, $mdchannelAndLocaleSpecific] = $this->mapMetafieldsAttribute($rowData['node']['metafields']['edges'] ?? [], $metaFieldAllAttr);
+            [$metaFieldCommon, $metaFieldLocaleSpecific, $metaFieldChannelSpecific, $metaFieldChannelAndLocaleSpecific] = $this->mapMetafieldsAttribute($rowData['node']['metafields']['edges'] ?? [], $metaFieldAllAttr);
 
-            $common = array_merge($pcommon, $scommon, $mdcommon);
+            $common = array_merge($productCommon, $seoCommon, $metaFieldCommon);
             $common['status'] = $rowData['node']['status'] == 'ACTIVE' ? 'true' : 'false';
-            $locale_specific = array_merge($plocale_specific, $slocale_specific, $mdlocale_specific);
-            $channel_specific = array_merge($pchannel_specific, $schannel_specific, $mdchannel_specific);
-            $channelAndLocaleSpecific = array_merge($pchannelAndLocaleSpecific, $schannelAndLocaleSpecific, $mdchannelAndLocaleSpecific);
-            $this->requestJobLocaleAndChannel();
+            $localeSpecific = array_merge($productLocaleSpecific, $seoLocaleSpecific, $metaFieldLocaleSpecific);
+            $channelSpecific = array_merge($productChannelSpecific, $seoChannelSpecific, $metaFieldChannelSpecific);
+            $channelAndLocaleSpecific = array_merge($productChannelAndLocaleSpecific, $seoChannelAndLocaleSpecific, $metaFieldChannelAndLocaleSpecific);
+            $imagre = $mappingAttr['images'] ?? null;
+            $allMappedImageAttrs = explode(',', $imagre);
             if ($count > 0) {
                 $parentData = $this->processConfigurableProduct(
                     $rowData,
@@ -366,10 +379,11 @@ class Importer extends AbstractImporter
                     $image,
                     $imageMediaids,
                     $common,
-                    $locale_specific,
-                    $channel_specific,
+                    $localeSpecific,
+                    $channelSpecific,
                     $channelAndLocaleSpecific,
-                    $mediaMapping,
+                    $allMappedImageAttrs,
+                    $variantImageAttr,
                     $extractVariantAttr,
                     $metaFieldAllAttr
                 );
@@ -386,15 +400,15 @@ class Importer extends AbstractImporter
                     $image,
                     $imageMediaids,
                     $common,
-                    $locale_specific,
-                    $channel_specific,
+                    $localeSpecific,
+                    $channelSpecific,
                     $channelAndLocaleSpecific,
-                    $mediaMapping,
+                    $allMappedImageAttrs,
                     $extractVariantAttr,
-                    $mdcommon,
-                    $mdchannel_specific,
-                    $mdlocale_specific,
-                    $mdchannelAndLocaleSpecific
+                    $metaFieldCommon,
+                    $metaFieldChannelSpecific,
+                    $metaFieldLocaleSpecific,
+                    $metaFieldChannelAndLocaleSpecific
                 );
 
                 if (! $childData) {
@@ -425,10 +439,11 @@ class Importer extends AbstractImporter
         $image,
         $imageMediaids,
         $common,
-        $locale_specific,
-        $channel_specific,
+        $localeSpecific,
+        $channelSpecific,
         $channelAndLocaleSpecific,
-        $mediaMapping,
+        $allMappedImageAttrs,
+        $variantImageAttr,
         $extractVariantAttr,
         $metaFieldAllAttr
     ) {
@@ -443,7 +458,7 @@ class Importer extends AbstractImporter
         $familyModel = $this->attributeFamilyRepository->where('id', $family_code)->first();
 
         if (! $familyModel) {
-            $this->jobLogger->warning('family not exist for the title:- ['.$rowData['node']['title'].'] 1st you need to import family');
+            $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.family-not-exist', ['title' => $rowData['node']['title']]));
 
             return null;
         }
@@ -469,14 +484,13 @@ class Importer extends AbstractImporter
             $familyModel,
             $attributes,
             $common,
-            $locale_specific,
-            $channel_specific,
+            $localeSpecific,
+            $channelSpecific,
             $channelAndLocaleSpecific,
-            $mediaMapping,
+            $allMappedImageAttrs,
             $image,
             $imageMediaids
         );
-
         if ($configId === null) {
             return null;
         }
@@ -485,33 +499,25 @@ class Importer extends AbstractImporter
             $this->parentMapping($rowData['node']['handle'], $shopifyProductId, $this->import->id);
         }
 
-        $mappedImageAttr = [];
-        $allMediaIdVariants = [];
-
-        $variantProductData = $this->processVariants(
-            $variants,
-            $rowData,
-            $shopifyProductId,
-            $configId,
-            $extractVariantAttr,
-            $mediaMapping,
-            $metaFieldAllAttr,
-            $allMediaIdVariants
-        );
-
-        if (! empty($mediaMapping) && $mediaMapping['mediaType'] === 'image') {
-            $mappedImageAttr = $this->processMappedImages($mediaMapping, $image, $configId, $storeForVariant, $rowData['node']['title'] ?? '', $imageMediaids, $rowData['node']['handle'] ?? '', $rowData['node']['id'], $allMediaIdVariants);
-        }
-
-        if (! empty($mediaMapping) && $mediaMapping['mediaType'] === 'gallery') {
-            $mappedImageAttr = $this->processMappedGallery($mediaMapping, $image, $configId, $storeForVariant, $rowData['node']['title'] ?? '', $imageMediaids, $rowData['node']['handle'] ?? '', $rowData['node']['id'], $allMediaIdVariants);
-        }
+        $mappedImageAttr = $this->processMappedImages($allMappedImageAttrs, $image, $configId, $storeForVariant, $rowData['node']['title'] ?? '', $imageMediaids);
 
         if (! $mappedImageAttr) {
             return null;
         }
 
         [$mcommon, $mlocale_specific, $mchannel_specific, $mchannelAndLocaleSpecific] = $mappedImageAttr;
+
+        $variantProductData = $this->processVariants(
+            $variants,
+            $rowData,
+            $shopifyProductId,
+            $configId,
+            $storeForVariant,
+            $variantImageAttr,
+            $extractVariantAttr,
+            $allMappedImageAttrs,
+            $metaFieldAllAttr
+        );
 
         $dataToUpdate = [
             'sku'     => $rowData['node']['handle'],
@@ -520,12 +526,12 @@ class Importer extends AbstractImporter
             'locale'  => $this->locale,
             'values'  => [
                 'common'           => array_merge($common, $mcommon),
-                'channel_specific' => [
-                    $this->channel => array_merge($channel_specific, $mchannel_specific),
+                'channelSpecific' => [
+                    $this->channel => array_merge($channelSpecific, $mchannel_specific),
                 ],
 
-                'locale_specific'  => [
-                    $this->locale => array_merge($locale_specific, $mlocale_specific),
+                'localeSpecific'  => [
+                    $this->locale => array_merge($localeSpecific, $mlocale_specific),
                 ],
 
                 'channel_locale_specific' => [
@@ -537,27 +543,24 @@ class Importer extends AbstractImporter
             'variants'   => $variantProductData,
             'categories' => $unopimCategory,
         ];
-
         $product = $this->productRepository->update($dataToUpdate, $configId);
         $allVariant = $product->variants?->toArray();
         $ids = array_column($allVariant, 'id');
         $skus = array_column($allVariant, 'sku');
         $formattedArray = array_combine($skus, $ids);
+
         $variantProductData = array_values($variantProductData);
         foreach ($product->variants->toArray() as $key => $svariant) {
-            $variantData = $variantProductData[$key] ?? $variantProductData[$svariant['id']] ?? null;
-            if (! $variantData) {
+            $variantData = null;
+            if (isset($variantProductData[$key])) {
+                $variantData = $variantProductData[$key];
+            } elseif (isset($variantProductData[$svariant['id']])) {
+                $variantData = $variantProductData[$svariant['id']];
+            } else {
                 continue;
             }
 
-            $sku = $variantData['sku'] ?? null;
-            if (! $sku || ! isset($formattedArray[$sku])) {
-                $this->jobLogger->warning(sprintf('%s variant SKU not found in parent product %s', $sku, $product->sku));
-
-                continue;
-            }
-
-            $product = $this->productRepository->update($variantData, $formattedArray[$sku]);
+            $product = $this->productRepository->update($variantData, $formattedArray[$variantData['sku']]);
         }
 
         return true;
@@ -568,10 +571,11 @@ class Importer extends AbstractImporter
         array $rowData,
         string $shopifyProductId,
         int $configId,
+        array $storeForVariant,
+        ?string $variantImageAttr,
         array $extractVariantAttr,
-        array $mediaMapping,
+        array $allMappedImageAttrs,
         array $metaFieldAllAttr,
-        &$allMediaIdVariants,
     ) {
         $variantSkus = [];
         $variantProductData = [];
@@ -582,13 +586,15 @@ class Importer extends AbstractImporter
         foreach ($variants as $key => $productVariant) {
             $vsku = $productVariant['node']['sku'] ?? null;
             if (empty($vsku)) {
-                $this->jobLogger->warning('Variant SKU not found in product '.$shopifyProductId);
+
+                $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.variant-sku-not-exist', ['id' => $shopifyProductId]));
 
                 continue;
             }
             $vsku = str_replace(["\r", "\n"], '', $vsku);
             if (in_array($vsku, $variantSkus)) {
-                $this->jobLogger->warning($vsku.':- Duplicate SKU Found in product');
+
+                $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.duplicate-sku', ['sku' => $vsku]));
 
                 continue;
             }
@@ -600,99 +606,85 @@ class Importer extends AbstractImporter
 
             $variantProductExist = $this->productRepository->findOneByField('sku', $vsku);
             $imageValue = null;
-
-            $variantImageAttr = $mediaMapping['mediaAttributes'] ?? null;
-
-            if (is_string($variantImageAttr)) {
-                $variantImageAttr = explode(',', $variantImageAttr);
-            }
-            if (is_array($variantImageAttr)) {
-                $variantImageAttr = $variantImageAttr[0];
-            }
-            $mappingAttr = $variantImageAttr ?? null;
-            if ($mediaMapping['mediaType'] == 'gallery') {
-                $mappingAttr = $variantImageAttr.'_0';
-            }
             if (! empty($productVariant['node']['image'])) {
                 $imageUrl = $productVariant['node']['image']['originalSrc'];
-                $mediaId = $productVariant['node']['media']['nodes'][0]['id'];
+                $fileName = explode('/', $imageUrl);
+                $fileName = end($fileName);
+                $fileName = explode('?', $fileName)[0];
+                $imageValue = $storeForVariant[$fileName] ?? null;
+                $tempFile = '/tmp/tmpstorage/'.$fileName;
                 $variantImage = $variantProductExist->id ?? $configId;
-                if ($variantImageAttr) {
-                    $imagePath = 'product'.DIRECTORY_SEPARATOR.$variantImage.DIRECTORY_SEPARATOR.$variantImageAttr.DIRECTORY_SEPARATOR;
-                    $imageValue = $this->handleUrlField($imageUrl, $imagePath);
-                    $mappingMedia = $this->checkMappingInDbForImage($mappingAttr, 'productImage', $vsku);
-                    $allMediaIdVariants[] = $mediaId;
-                    if (empty($mappingMedia)) {
-                        $this->imageMapping('productImage', $mappingAttr, $mediaId, $this->import->id, $shopifyProductId, $vsku);
-                    }
+                if (! $imageValue && $variantImageAttr) {
+                    $imageValue = $this->fileStorer->store(
+                        path: 'product'.DIRECTORY_SEPARATOR.$variantImage.DIRECTORY_SEPARATOR.$variantImageAttr,
+                        file: new UploadedFile($tempFile, $fileName),
+                        options: [FileStorer::HASHED_FOLDER_NAME_KEY => true]
+                    );
                 }
             }
 
             $variantProductValue = $this->formatVariantData($productVariant, $extractVariantAttr);
+
             if (! $variantProductValue) {
                 continue;
             }
 
-            [$vcommon, $vlocale_specific, $vchannel_specific, $vchannelAndLocaleSpecific] = $variantProductValue;
-            if ($variantImageAttr) {
-                $vimage = $variantImageAttr;
-                $vcommon[$vimage] = isset($mcommon[$vimage]) ? '' : ($vlocale_specific[$vimage] ?? null);
-                $vlocale_specific[$vimage] = isset($mlocale_specific[$vimage]) ? '' : ($vlocale_specific[$vimage] ?? null);
-                $vchannel_specific[$vimage] = isset($mchannel_specific[$vimage]) ? '' : ($vchannel_specific[$vimage] ?? null);
-                $vchannelAndLocaleSpecific[$vimage] = isset($mchannelAndLocaleSpecific[$vimage]) ? '' : ($vchannelAndLocaleSpecific[$vimage] ?? null);
+            [$variantCommon, $variantLocaleSpecific, $variantChannelSpecific, $variantChannelAndLocaleSpecific] = $variantProductValue;
+
+            foreach ($allMappedImageAttrs as $variantImage) {
+                $variantCommon[$variantImage] = isset($mcommon[$variantImage]) ? '' : ($variantLocaleSpecific[$variantImage] ?? null);
+                $variantLocaleSpecific[$variantImage] = isset($mlocale_specific[$variantImage]) ? '' : ($variantLocaleSpecific[$variantImage] ?? null);
+                $variantChannelSpecific[$variantImage] = isset($mchannel_specific[$variantImage]) ? '' : ($variantChannelSpecific[$variantImage] ?? null);
+                $variantChannelAndLocaleSpecific[$variantImage] = isset($mchannelAndLocaleSpecific[$variantImage]) ? '' : ($variantChannelAndLocaleSpecific[$variantImage] ?? null);
             }
 
             if ($variantImageAttr) {
+                $variantImageAttribute = $this->attributeRepository->findOneByField('code', $variantImageAttr);
+                if ($variantImageAttribute->is_required && empty($imageValue)) {
 
-                $vImageAttribute = $this->attributes[$variantImageAttr] ?? null;
-                if ($vImageAttribute->toArray()['type'] === 'gallery' && $imageValue) {
-                    $imageValue = explode(',', $imageValue);
-                }
-
-                if ($vImageAttribute->is_required && empty($imageValue)) {
-                    $this->jobLogger->warning($variantImageAttr.':- Field Is required for Sku:-'.$vsku);
+                    $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.required-field', ['sku' => $vsku, 'attribute' => $variantImageAttr]));
 
                     continue;
                 }
-                if (! $vImageAttribute?->value_per_locale && ! $vImageAttribute?->value_per_channel) {
-                    $vcommon[$variantImageAttr] = $imageValue;
+                if (! $variantImageAttribute?->value_per_locale && ! $variantImageAttribute?->value_per_channel) {
+                    $variantCommon[$variantImageAttr] = $imageValue;
                 }
 
-                if ($vImageAttribute?->value_per_locale && ! $vImageAttribute?->value_per_channel) {
-                    $vlocale_specific[$variantImageAttr] = $imageValue;
+                if ($variantImageAttribute?->value_per_locale && ! $variantImageAttribute?->value_per_channel) {
+                    $variantLocaleSpecific[$variantImageAttr] = $imageValue;
                 }
 
-                if (! $vImageAttribute?->value_per_locale && $vImageAttribute?->value_per_channel) {
-                    $vchannel_specific[$variantImageAttr] = $imageValue;
+                if (! $variantImageAttribute?->value_per_locale && $variantImageAttribute?->value_per_channel) {
+                    $variantChannelSpecific[$variantImageAttr] = $imageValue;
                 }
 
-                if ($vImageAttribute?->value_per_locale && $vImageAttribute?->value_per_channel) {
-                    $vchannelAndLocaleSpecific[$variantImageAttr] = $imageValue;
+                if ($variantImageAttribute?->value_per_locale && $variantImageAttribute?->value_per_channel) {
+                    $variantChannelAndLocaleSpecific[$variantImageAttr] = $imageValue;
                 }
             }
 
             [$vMdcommon, $vMdlocale_specific, $vMdchannel_specific, $vMdchannelAndLocaleSpecific] = $this->mapMetafieldsAttribute($productVariant['node']['metafields']['edges'] ?? [], $metaFieldAllAttr);
             $vkey = $variantProductExist ? $variantProductExist->id : 'variant_'.$key;
+
             if ($this->updateVarint) {
                 $this->updatedItemsCount++;
             } else {
                 $this->createdItemsCount++;
             }
-
             $variantProductData[$vkey] = [
                 'sku'    => $vsku ?? '',
                 'status' => $rowData['node']['status'] == 'ACTIVE' ? 1 : 0,
                 'values' => [
-                    'common'           => array_merge($vcommon, $vMdcommon),
-                    'channel_specific' => [
-                        $this->channel => array_merge($vchannel_specific, $vMdchannel_specific),
+                    'common'           => array_merge($variantCommon, $vMdcommon),
+                    'channelSpecific' => [
+                        $this->channel => array_merge($variantChannelSpecific, $vMdchannel_specific),
                     ],
-                    'locale_specific'  => [
-                        $this->locale => array_merge($vlocale_specific, $vMdlocale_specific),
+                    'localeSpecific'  => [
+                        $this->locale => array_merge($variantLocaleSpecific, $vMdlocale_specific),
                     ],
                     'channel_locale_specific' => [
                         $this->channel => [
-                            $this->locale => array_merge($vchannelAndLocaleSpecific, $vMdchannelAndLocaleSpecific),
+                            $this->locale => array_merge($variantChannelAndLocaleSpecific, $vMdchannelAndLocaleSpecific),
                         ],
                     ],
                 ],
@@ -712,13 +704,14 @@ class Importer extends AbstractImporter
         if (! $configProductExist) {
 
             if (! $familyModel) {
-                $this->jobLogger->warning('family not mapping for the title:- ['.$rowData['node']['title'].']');
+                $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.family-not-mapping', ['title' => $rowData['node']['title']]));
 
                 return null;
             }
+
             $this->updateVarint = false;
             $data[$rowData['node']['handle']] = [
-                'type'                => 'configurable',
+                'type'                => self::CONFIGURABLE,
                 'sku'                 => $rowData['node']['handle'],
                 'status'              => $rowData['node']['status'] == 'ACTIVE' ? 1 : 0,
                 'attribute_family_id' => $familyModel->id,
@@ -743,7 +736,7 @@ class Importer extends AbstractImporter
 
         foreach ($options as $attr) {
             $attrCode = preg_replace('/[^A-Za-z0-9]+/', '_', strtolower($attr['name']));
-            $vAttribute = $this->attributes[$attrCode] ?? null;
+            $vAttribute = $this->attributeRepository->findOneByField('code', $attrCode);
 
             if ($vAttribute) {
                 $attributes[$attrCode] = $attrCode;
@@ -753,7 +746,7 @@ class Importer extends AbstractImporter
         }
 
         if (! empty($attrNotExist)) {
-            $this->jobLogger->warning(json_encode($attrNotExist).' Attributes not exist for product.');
+            $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.attribute-not-exist', ['attributes' => json_encode($attrNotExist)]));
 
             return null;
         }
@@ -772,22 +765,22 @@ class Importer extends AbstractImporter
         $image,
         $imageMediaids,
         $common,
-        $locale_specific,
-        $channel_specific,
+        $localeSpecific,
+        $channelSpecific,
         $channelAndLocaleSpecific,
-        $mediaMapping,
+        $allMappedImageAttrs,
         $extractVariantAttr,
-        $mdcommon,
-        $mdchannel_specific,
-        $mdlocale_specific,
-        $mdchannelAndLocaleSpecific
+        $metaFieldCommon,
+        $metaFieldChannelSpecific,
+        $metaFieldLocaleSpecific,
+        $metaFieldChannelAndLocaleSpecific
     ) {
         $shopifyProductId = $rowData['node']['id'];
         $storeForVariant = [];
         foreach ($variants as $key => $productVariant) {
             $variantData = $this->formatVariantData($productVariant, $extractVariantAttr);
             if (empty($productVariant['node']['sku'])) {
-                $this->jobLogger->warning('SKU not found in product '.$shopifyProductId);
+                $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.not-found-sku', ['id' => $shopifyProductId]));
 
                 continue;
             }
@@ -797,13 +790,14 @@ class Importer extends AbstractImporter
             return false;
         }
 
-        [$vcommon, $vlocale_specific, $vchannel_specific, $vchannelAndLocaleSpecific] = $variantData;
+        [$variantCommon, $variantLocaleSpecific, $variantChannelSpecific, $variantChannelAndLocaleSpecific] = $variantData;
 
-        if (empty($vcommon['sku'])) {
-            $vcommon['sku'] = $rowData['node']['handle'];
+        if (empty($variantCommon['sku'])) {
+            $variantCommon['sku'] = $rowData['node']['handle'];
         }
 
-        $productExist = $this->productRepository->findOneByField('sku', $vcommon['sku']);
+        $productExist = $this->productRepository->findOneByField('sku', $variantCommon['sku']);
+
         $simpleId = $productExist?->id;
         $this->update = true;
         $variantSku = $productVariant['node']['sku'] ?? $rowData['node']['handle'];
@@ -817,60 +811,47 @@ class Importer extends AbstractImporter
             $familyModel = $this->attributeFamilyRepository->where('id', $simpleProductFamilyId)->first();
 
             if (! $familyModel) {
-                $this->jobLogger->warning('family not mapping for the title:- ['.$rowData['node']['title'].']');
+                $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.family-not-mapping', ['title' => $rowData['node']['title']]));
 
                 return false;
             }
 
-            $data[$vcommon['sku']] = [
-                'type'                => 'simple',
-                'sku'                 => $vcommon['sku'],
+            $data[$variantCommon['sku']] = [
+                'type'                => self::SIMPLE,
+                'sku'                 => $variantCommon['sku'],
                 'status'              => $rowData['node']['status'] == 'ACTIVE' ? 1 : 0,
                 'attribute_family_id' => $simpleProductFamilyId,
             ];
             $this->update = false;
 
-            $createdProduct = $this->productRepository->create($data[$vcommon['sku']]);
+            $createdProduct = $this->productRepository->create($data[$variantCommon['sku']]);
             $simpleId = $createdProduct->id;
         }
 
-        $mappedImageAttr = [
-            [],
-            [],
-            [],
-            [],
-        ];
+        $mappedImageAttr = $this->processMappedImages($allMappedImageAttrs, $image, $simpleId, $storeForVariant, $rowData['node']['title'] ?? '', $imageMediaids);
 
-        if (! empty($mediaMapping) && $mediaMapping['mediaType'] === 'image') {
-            $mappedImageAttr = $this->processMappedImages($mediaMapping, $image, $simpleId, $storeForVariant, $rowData['node']['title'] ?? '', $imageMediaids, $vcommon['sku'], $rowData['node']['id']);
-        }
-
-        if (! empty($mediaMapping) && $mediaMapping['mediaType'] === 'gallery') {
-            $mappedImageAttr = $this->processMappedGallery($mediaMapping, $image, $simpleId, $storeForVariant, $rowData['node']['title'] ?? '', $imageMediaids, $vcommon['sku'], $rowData['node']['id']);
-        }
-
-        if (! $mappedImageAttr && ! empty($mediaMapping)) {
+        if (! $mappedImageAttr) {
             return false;
         }
 
         [$mcommon, $mlocale_specific, $mchannel_specific, $mchannelAndLocaleSpecific] = $mappedImageAttr;
 
         $dataToUpdate = [
-            'sku'     => $vcommon['sku'],
+            'sku'     => $variantCommon['sku'],
             'channel' => $this->channel,
             'status'  => $rowData['node']['status'] == 'ACTIVE' ? 1 : 0,
             'locale'  => $this->locale,
             'values'  => [
-                'common'           => array_merge($common, $vcommon, $mcommon, $mdcommon),
-                'channel_specific' => [
-                    $this->channel => array_merge($channel_specific, $vchannel_specific, $mchannel_specific, $mdchannel_specific),
+                'common'           => array_merge($common, $variantCommon, $mcommon, $metaFieldCommon),
+                'channelSpecific' => [
+                    $this->channel => array_merge($channelSpecific, $variantChannelSpecific, $mchannel_specific, $metaFieldChannelSpecific),
                 ],
-                'locale_specific'  => [
-                    $this->locale => array_merge($locale_specific, $vlocale_specific, $mlocale_specific, $mdlocale_specific),
+                'localeSpecific'  => [
+                    $this->locale => array_merge($localeSpecific, $variantLocaleSpecific, $mlocale_specific, $metaFieldLocaleSpecific),
                 ],
                 'channel_locale_specific' => [
                     $this->channel => [
-                        $this->locale => array_merge($channelAndLocaleSpecific, $vchannelAndLocaleSpecific, $mchannelAndLocaleSpecific, $mdchannelAndLocaleSpecific),
+                        $this->locale => array_merge($channelAndLocaleSpecific, $variantChannelAndLocaleSpecific, $mchannelAndLocaleSpecific, $metaFieldChannelAndLocaleSpecific),
                     ],
                 ],
             ],
@@ -882,19 +863,11 @@ class Importer extends AbstractImporter
         return $product;
     }
 
-    public function requestJobLocaleAndChannel()
-    {
-        request()->merge([
-            'locale'  => $this->locale,
-            'channel' => $this->channel,
-        ]);
-    }
-
     public function mapMetafieldsAttribute($shopifyMetaFiled, $metaFieldAllAttr): array
     {
         $common = [];
-        $locale_specific = [];
-        $channel_specific = [];
+        $localeSpecific = [];
+        $channelSpecific = [];
         $channelAndLocaleSpecific = [];
         foreach ($shopifyMetaFiled ?? [] as $metaData) {
             if (! in_array($metaData['node']['key'], $metaFieldAllAttr)) {
@@ -902,27 +875,17 @@ class Importer extends AbstractImporter
             }
             $unoAttr = $metaData['node']['key'];
             $source = $metaData['node']['value'];
-
-            $attribute = $this->attributes[$metaData['node']['key']] ?? null;
-            if (! $attribute) {
-                continue;
-            }
-            $unitOption = $this->shoifyMetaFieldTypeData[$metaData['node']['type']]['unitoptions'] ?? null;
-            if ($unitOption) {
-                $unitValue = json_decode($source, true);
-                $source = $unitValue['value'] ?? 0;
-            }
-
+            $attribute = $this->attributeRepository->findOneByField('code', $metaData['node']['key']);
             if (! $attribute?->value_per_locale && ! $attribute?->value_per_channel) {
                 $common[$unoAttr] = $source;
             }
 
             if ($attribute?->value_per_locale && ! $attribute?->value_per_channel) {
-                $locale_specific[$unoAttr] = $source;
+                $localeSpecific[$unoAttr] = $source;
             }
 
             if (! $attribute?->value_per_locale && $attribute?->value_per_channel) {
-                $channel_specific[$unoAttr] = $source;
+                $channelSpecific[$unoAttr] = $source;
             }
 
             if ($attribute?->value_per_locale && $attribute?->value_per_channel) {
@@ -932,8 +895,8 @@ class Importer extends AbstractImporter
 
         return [
             $common,
-            $locale_specific,
-            $channel_specific,
+            $localeSpecific,
+            $channelSpecific,
             $channelAndLocaleSpecific,
         ];
     }
@@ -972,33 +935,29 @@ class Importer extends AbstractImporter
     /*
     * process image attributes
     */
-    public function processMappedImages(array $mediaMapping, array $image, string $configId, array &$storeForVariant, string $title, $imageMediaids, $mappingSku, $productId): ?array
+    public function processMappedImages(array $allMappedImageAttrs, array $image, string $configId, array &$storeForVariant, string $title = '', $imageMediaids = []): ?array
     {
         $common = [];
-        $locale_specific = [];
-        $channel_specific = [];
+        $localeSpecific = [];
+        $channelSpecific = [];
         $channelAndLocaleSpecific = [];
-        $allMediaAttributes = $mediaMapping['mediaAttributes'] ?? [];
-        if (! is_array($allMediaAttributes)) {
-            $allMediaAttributes = explode(',', $allMediaAttributes);
-        }
-
-        foreach ($allMediaAttributes as $index => $mappedImageAttr) {
+        foreach ($allMappedImageAttrs as $index => $mappedImageAttr) {
             $imgStore = '';
-            $attribute = $this->attributes[$mappedImageAttr] ?? null;
+            $attribute = $this->attributeRepository->findOneByField('code', $mappedImageAttr);
             if (! empty($image[$index])) {
                 if ($attribute?->is_required && empty($image[$index])) {
-                    $this->jobLogger->warning($mappedImageAttr.':- Field Is required '.$title);
+                    $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.required-field', ['sku' => $title, 'attribute' => $mappedImageAttr]));
 
                     return null;
                 }
 
-                $imagePath = 'product'.DIRECTORY_SEPARATOR.$configId.DIRECTORY_SEPARATOR.$mappedImageAttr.DIRECTORY_SEPARATOR;
-                $imgStore = $this->handleUrlField($image[$index], $imagePath);
-                $mappingMedia = $this->checkMappingInDbForImage($mappedImageAttr, 'productImage', $mappingSku);
-                if (empty($mappingMedia)) {
-                    $this->imageMapping('productImage', $mappedImageAttr, $imageMediaids[$index], $this->import->id, $productId, $mappingSku);
-                }
+                $fileName = explode('/', $image[$index]);
+
+                $imgStore = $storeForVariant[end($fileName)] = $this->fileStorer->store(
+                    path: 'product'.DIRECTORY_SEPARATOR.$configId.DIRECTORY_SEPARATOR.$mappedImageAttr,
+                    file: new UploadedFile($image[$index], end($fileName)),
+                    options: [FileStorer::HASHED_FOLDER_NAME_KEY => true]
+                );
             }
 
             if (! $attribute?->value_per_locale && ! $attribute?->value_per_channel) {
@@ -1006,11 +965,11 @@ class Importer extends AbstractImporter
             }
 
             if ($attribute?->value_per_locale && ! $attribute?->value_per_channel) {
-                $locale_specific[$mappedImageAttr] = $imgStore;
+                $localeSpecific[$mappedImageAttr] = $imgStore;
             }
 
             if (! $attribute?->value_per_locale && $attribute?->value_per_channel) {
-                $channel_specific[$mappedImageAttr] = $imgStore;
+                $channelSpecific[$mappedImageAttr] = $imgStore;
             }
 
             if ($attribute?->value_per_locale && $attribute?->value_per_channel) {
@@ -1020,81 +979,8 @@ class Importer extends AbstractImporter
 
         return [
             $common,
-            $locale_specific,
-            $channel_specific,
-            $channelAndLocaleSpecific,
-        ];
-    }
-
-    /*
-    * process image attributes
-    */
-    public function processMappedGallery(array $mediaMapping, array $image, string $configId, array &$storeForVariant, string $title, $imageMediaids, $mappingSku, $productId, $allMediaIdVariants = []): ?array
-    {
-        $common = [];
-        $locale_specific = [];
-        $channel_specific = [];
-        $channelAndLocaleSpecific = [];
-        $allMediaAttributes = $mediaMapping['mediaAttributes'] ?? [];
-        if (! is_array($allMediaAttributes)) {
-            $allMediaAttributes = explode(',', $allMediaAttributes);
-        }
-
-        foreach ($allMediaAttributes as $index => $mappedImageAttr) {
-            $imgStore = [];
-            if (! isset($this->attributes[$mappedImageAttr])) {
-                continue;
-            }
-            $attribute = $this->attributes[$mappedImageAttr];
-
-            if ($attribute?->is_required && empty($image)) {
-                $this->jobLogger->warning($mappedImageAttr.':- Field Is required '.$title);
-
-                return null;
-            }
-
-            if (! empty($image)) {
-                $init = 0;
-                foreach ($image as $imageUrl) {
-                    if (in_array($imageMediaids[$init], array_unique($allMediaIdVariants))) {
-                        unset($imageMediaids[$init]);
-                        $imageMediaids = array_values($imageMediaids);
-
-                        continue;
-                    }
-
-                    $galleryAttr = $mappedImageAttr.'_'.$init;
-                    $mappingMedia = $this->checkMappingInDbForImage($galleryAttr, 'productImage', $mappingSku);
-                    if (empty($mappingMedia)) {
-                        $this->imageMapping('productImage', $galleryAttr, $imageMediaids[$init], $this->import->id, $productId, $mappingSku);
-                    }
-                    $imagePath = 'product'.DIRECTORY_SEPARATOR.$configId.DIRECTORY_SEPARATOR.$mappedImageAttr.DIRECTORY_SEPARATOR;
-                    $imgStore[] = $this->handleUrlField($imageUrl, $imagePath);
-                    $init++;
-                }
-            }
-
-            if (! $attribute?->value_per_locale && ! $attribute?->value_per_channel) {
-                $common[$mappedImageAttr] = $imgStore;
-            }
-
-            if ($attribute?->value_per_locale && ! $attribute?->value_per_channel) {
-                $locale_specific[$mappedImageAttr] = $imgStore;
-            }
-
-            if (! $attribute?->value_per_locale && $attribute?->value_per_channel) {
-                $channel_specific[$mappedImageAttr] = $imgStore;
-            }
-
-            if ($attribute?->value_per_locale && $attribute?->value_per_channel) {
-                $channelAndLocaleSpecific[$mappedImageAttr] = $imgStore;
-            }
-        }
-
-        return [
-            $common,
-            $locale_specific,
-            $channel_specific,
+            $localeSpecific,
+            $channelSpecific,
             $channelAndLocaleSpecific,
         ];
     }
@@ -1143,15 +1029,12 @@ class Importer extends AbstractImporter
     public function mapAttributes($attributes, $rowData, $isSeo = false): ?array
     {
         $common = [];
-        $locale_specific = [];
-        $channel_specific = [];
+        $localeSpecific = [];
+        $channelSpecific = [];
         $channelAndLocaleSpecific = [];
 
         foreach ($attributes as $shopifyAttr => $unoAttr) {
-            if (! isset($this->attributes[$unoAttr])) {
-                continue;
-            }
-            $attribute = $this->attributes[$unoAttr];
+            $attribute = $this->attributeRepository->findOneByField('code', $unoAttr);
 
             if ($isSeo) {
                 if ($shopifyAttr == 'metafields_global_title_tag') {
@@ -1169,7 +1052,7 @@ class Importer extends AbstractImporter
                 $source = implode(',', $source);
             }
             if ($attribute->is_required && empty($source)) {
-                $this->jobLogger->warning($unoAttr.':- Field Is required For the title :-'.$rowData['node']['title']);
+                $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.required-field', ['sku' => $rowData['node']['title'], 'attribute' => $unoAttr]));
 
                 return null;
             }
@@ -1179,11 +1062,11 @@ class Importer extends AbstractImporter
             }
 
             if ($attribute?->value_per_locale && ! $attribute?->value_per_channel) {
-                $locale_specific[$unoAttr] = $source;
+                $localeSpecific[$unoAttr] = $source;
             }
 
             if (! $attribute?->value_per_locale && $attribute?->value_per_channel) {
-                $channel_specific[$unoAttr] = $source;
+                $channelSpecific[$unoAttr] = $source;
             }
 
             if ($attribute?->value_per_locale && $attribute?->value_per_channel) {
@@ -1193,87 +1076,87 @@ class Importer extends AbstractImporter
 
         return [
             $common,
-            $locale_specific,
-            $channel_specific,
+            $localeSpecific,
+            $channelSpecific,
             $channelAndLocaleSpecific,
         ];
     }
 
     /**
-     * Variant Data formater
+     * Classifies an attribute based on its value_per_locale and value_per_channel flags.
+     */
+    private function classifyAttribute($attribute, $name, $value, &$common, &$localeSpecific, &$channelSpecific, &$channelAndLocaleSpecific): void
+    {
+        match (true) {
+            !$attribute?->value_per_locale && !$attribute?->value_per_channel => $common[$name] = $value,
+            $attribute?->value_per_locale && !$attribute?->value_per_channel  => $localeSpecific[$name] = $value,
+            !$attribute?->value_per_locale && $attribute?->value_per_channel  => $channelSpecific[$name] = $value,
+            $attribute?->value_per_locale && $attribute?->value_per_channel   => $channelAndLocaleSpecific[$name] = $value,
+        };
+    }
+
+    /**
+     * Variant Data Formatter
      */
     public function formatVariantData($variantData, $extractVariantAttr): ?array
     {
         // Initialize arrays to store different types of attributes
-        $Opcommon = $Oplocale_specific = $Opchannel_specific = $OpchannelAndLocaleSpecific = [];
-        $vcommon = $vlocale_specific = $vchannel_specific = $vchannelAndLocaleSpecific = [];
+        $optionCommon = $optionLocaleSpecific = $optionChannelSpecific = $optionChannelAndLocaleSpecific = [];
+        $variantCommon = $variantLocaleSpecific = $variantChannelSpecific = $variantChannelAndLocaleSpecific = [];
 
-        // Helper function to classify attributes
-        $classifyAttribute = function ($attribute, $name, $value, &$common, &$locale_specific, &$channel_specific, &$channelAndLocaleSpecific) {
-            if (! $attribute?->value_per_locale && ! $attribute?->value_per_channel) {
-                $common[$name] = $value;
-            } elseif ($attribute?->value_per_locale && ! $attribute?->value_per_channel) {
-                $locale_specific[$name] = $value;
-            } elseif (! $attribute?->value_per_locale && $attribute?->value_per_channel) {
-                $channel_specific[$name] = $value;
-            } elseif ($attribute?->value_per_locale && $attribute?->value_per_channel) {
-                $channelAndLocaleSpecific[$name] = $value;
-            }
-        };
-
-        // Process selected options
         foreach ($variantData['node']['selectedOptions'] ?? [] as $option) {
             if ($option['name'] == 'Title' && $option['value'] == 'Default Title') {
                 continue;
             }
 
             $name = preg_replace('/[^A-Za-z0-9]+/', '_', strtolower($option['name']));
-            if (! isset($this->attributes[$name])) {
-                continue;
-            }
-            $attribute = $this->attributes[$name];
+            $attribute = $this->attributeRepository->findOneByField('code', $name);
 
             $optionvalue = trim(preg_replace('/[^A-Za-z0-9]+/', '-', $option['value']), '-');
             $optionForShopify = $attribute->options()->where('code', $optionvalue)?->get()?->first();
 
-            if (! $optionForShopify) {
-                $this->jobLogger->warning("{$option['name']} - {$option['value']}:- Option is not found in the unopim sku:- {$variantData['node']['sku']}");
+            if (!$optionForShopify) {
+                $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.option-not-found', [
+                    'sku' => $variantData['node']['sku'], 
+                    'attribute' => $option['name'], 
+                    'option' => $option['value']
+                ]));
 
                 return null;
             }
 
-            $classifyAttribute($attribute, $name, $optionForShopify?->code, $Opcommon, $Oplocale_specific, $Opchannel_specific, $OpchannelAndLocaleSpecific);
+            $this->classifyAttribute($attribute, $name, $optionForShopify?->code, $optionCommon, $optionLocaleSpecific, $optionChannelSpecific, $optionChannelAndLocaleSpecific);
         }
 
         // Process extracted variant attributes
         foreach ($extractVariantAttr as $shopifyAttr => $unoAttr) {
             $value = null;
-            if (! isset($this->attributes[$unoAttr])) {
-                continue;
-            }
-            $attribute = $this->attributes[$unoAttr];
+            $attribute = $this->attributeRepository->findOneByField('code', $unoAttr);
+
             switch ($shopifyAttr) {
                 case 'cost':
                     $costPerItem = $variantData['node']['inventoryItem']['unitCost'];
-                    $value[$this->currency] = $costPerItem ? (string) $costPerItem['amount'] : '0';
+                    $value[$this->currency] = $costPerItem ? (string)$costPerItem['amount'] : '0';
                     break;
 
                 case 'price':
-                    $value[$this->currency] = (string) ($variantData['node']['price'] ?? '0');
+                    $value[$this->currency] = (string)($variantData['node']['price'] ?? '0');
                     break;
 
                 case 'weight':
-                    $value = (string) ($variantData['node']['inventoryItem']['measurement']['weight']['value'] ?? '0');
+                    $value = (string)($variantData['node']['inventoryItem']['measurement']['weight']['value'] ?? '0');
                     break;
 
                 case 'barcode':
                     $value = $variantData['node']['barcode'] ?? '';
                     if ($attribute->is_required && empty($value)) {
-                        $this->jobLogger->warning("{$unoAttr}:- Unopim Field is required for the SKU :- {$variantData['node']['sku']}");
+                        $this->jobLogger->warning(trans('shopify::app.shopify.import.job.product.required-field', [
+                            'sku' => $variantData['node']['sku'], 
+                            'attribute' => $unoAttr
+                        ]));
 
                         return null;
                     }
-
                     break;
 
                 case 'taxable':
@@ -1281,7 +1164,7 @@ class Importer extends AbstractImporter
                     break;
 
                 case 'compareAtPrice':
-                    $value[$this->currency] = (string) ($variantData['node']['compareAtPrice'] ?? '0');
+                    $value[$this->currency] = (string)($variantData['node']['compareAtPrice'] ?? '0');
                     break;
 
                 case 'inventoryPolicy':
@@ -1297,17 +1180,16 @@ class Importer extends AbstractImporter
                     break;
             }
 
-            $classifyAttribute($attribute, $unoAttr, $value, $vcommon, $vlocale_specific, $vchannel_specific, $vchannelAndLocaleSpecific);
+            $this->classifyAttribute($attribute, $unoAttr, $value, $variantCommon, $variantLocaleSpecific, $variantChannelSpecific, $variantChannelAndLocaleSpecific);
         }
 
-        $vcommon['sku'] = str_replace(["\r", "\n"], '', $variantData['node']['sku']);
+        $variantCommon['sku'] = str_replace(["\r", "\n"], '', $variantData['node']['sku']);
 
-        // Return merged results
         return [
-            array_merge($vcommon, $Opcommon),
-            array_merge($vlocale_specific, $Oplocale_specific),
-            array_merge($vchannel_specific, $Opchannel_specific),
-            array_merge($vchannelAndLocaleSpecific, $OpchannelAndLocaleSpecific),
+            array_merge($variantCommon, $optionCommon),
+            array_merge($variantLocaleSpecific, $optionLocaleSpecific),
+            array_merge($variantChannelSpecific, $optionChannelSpecific),
+            array_merge($variantChannelAndLocaleSpecific, $optionChannelAndLocaleSpecific),
         ];
     }
 

@@ -4,7 +4,6 @@ use Illuminate\Support\Facades\Route;
 use Webkul\Shopify\Http\Controllers\CredentialController;
 use Webkul\Shopify\Http\Controllers\ImportMappingController;
 use Webkul\Shopify\Http\Controllers\MappingController;
-use Webkul\Shopify\Http\Controllers\MetaFieldController;
 use Webkul\Shopify\Http\Controllers\OptionController;
 use Webkul\Shopify\Http\Controllers\SettingController;
 
@@ -24,20 +23,6 @@ Route::group(['middleware' => ['admin'], 'prefix' => config('app.admin_url')], f
             Route::put('update/{id}', 'update')->name('shopify.credentials.update');
 
             Route::delete('delete/{id}', 'destroy')->name('shopify.credentials.delete');
-        });
-
-        Route::controller(MetaFieldController::class)->prefix('metafields')->group(function () {
-            Route::get('', 'index')->name('shopify.metafield.index');
-
-            Route::post('create', 'store')->name('shopify.metafield.store');
-
-            Route::get('edit/{id}', 'edit')->name('shopify.metafield.edit');
-
-            Route::put('update/{id}', 'update')->name('shopify.metafield.update');
-
-            Route::delete('delete/{id}', 'destroy')->name('shopify.metafield.delete');
-
-            Route::post('mass-delete', 'massDestroy')->name('shopify.metafield.mass_delete');
         });
 
         Route::prefix('export')->group(function () {
@@ -63,12 +48,9 @@ Route::group(['middleware' => ['admin'], 'prefix' => config('app.admin_url')], f
         });
 
         Route::controller(OptionController::class)->group(function () {
-
             Route::get('get-attribute', 'listAttributes')->name('admin.shopify.get-attribute');
 
             Route::get('get-image-attribute', 'listImageAttributes')->name('admin.shopify.get-image-attribute');
-
-            Route::get('get-gallery-attribute', 'listGalleryAttributes')->name('admin.shopify.get-gallery-attribute');
 
             Route::get('get-metafield-attribute', 'listMetafieldAttributes')->name('admin.shopify.get-metafield-attribute');
 

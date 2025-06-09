@@ -191,6 +191,7 @@ class OptionController extends Controller
         $query = request()->get('query') ?? '';
         $queryParams = request()->except(['page', 'query', 'entityName', 'attributeId', 'notInclude']);
         $attributeRepository = $this->attributeRepository;
+
         if (! empty($entityName)) {
             $entityName = json_decode($entityName);
             $attributeRepository = in_array('number', $entityName)
@@ -230,11 +231,9 @@ class OptionController extends Controller
         foreach ($attributes as $attribute) {
             $translatedLabel = $attribute->translate($currentLocaleCode)?->name;
             $formattedoptions[] = [
-                'id'         => $attribute->id,
-                'code'       => $attribute->code,
-                'type'       => $attribute?->type,
-                'validation' => $attribute->validation,
-                'label'      => ! empty($translatedLabel) ? $translatedLabel : "[{$attribute->code}]",
+                'id'    => $attribute->id,
+                'code'  => $attribute->code,
+                'label' => ! empty($translatedLabel) ? $translatedLabel : "[{$attribute->code}]",
             ];
         }
 
@@ -251,58 +250,10 @@ class OptionController extends Controller
     public function listImageAttributes(): JsonResponse
     {
         $query = request()->get('query') ?? '';
-        $queryParams = request()->except(['page', 'query', 'attributeId']);
-        $formattedoptions = [];
-        if (isset($queryParams['entityName'])) {
-            $attributeRepository = $this->attributeRepository->where('type', $queryParams['entityName']);
-        } elseif (isset($queryParams['mediaType'])) {
-            $attributeRepository = $this->attributeRepository->whereIn('type', [$queryParams['mediaType'], 'asset']);
-        } else {
-            $attributeRepository = $this->attributeRepository;
-        }
-        $currentLocaleCode = core()->getRequestedLocaleCode();
-
-        if (! empty($query)) {
-            $attributeRepository = $attributeRepository->where('code', 'LIKE', '%'.$query.'%');
-        }
-
-        $searchIdentifiers = isset($queryParams['identifiers']['columnName']) ? $queryParams['identifiers'] : [];
-
-        if (! empty($searchIdentifiers)) {
-            $values = $searchIdentifiers['values'] ?? [];
-
-            $attributeRepository = $attributeRepository->whereIn(
-                $searchIdentifiers['columnName'],
-                is_array($values) ? $values : [$values]
-            );
-        }
-
-        $attributes = $attributeRepository->get();
-
-        foreach ($attributes as $attribute) {
-            $translatedLabel = $attribute->translate($currentLocaleCode)?->name;
-            $formattedoptions[] = [
-                'id'    => $attribute->id,
-                'code'  => $attribute->code,
-                'label' => ! empty($translatedLabel) ? $translatedLabel : "[{$attribute->code}]",
-            ];
-        }
-
-        return new JsonResponse([
-            'options' => $formattedoptions,
-        ]);
-    }
-
-    /**
-     * List Gallery attributes.
-     */
-    public function listGalleryAttributes(): JsonResponse
-    {
-        $query = request()->get('query') ?? '';
 
         $queryParams = request()->except(['page', 'query', 'entityName', 'attributeId']);
 
-        $attributeRepository = $this->attributeRepository->where('type', 'gallery');
+        $attributeRepository = $this->attributeRepository->where('type', 'image');
 
         $currentLocaleCode = core()->getRequestedLocaleCode();
 
@@ -410,7 +361,6 @@ class OptionController extends Controller
                     'label' => ! empty($translatedLabel) ? $translatedLabel : "[{$attribute->code}]",
                 ];
             }
-
         }
 
         return new JsonResponse($formattedoptions);

@@ -29,30 +29,30 @@ trait TranslationTrait
         array $parentValues,
         ShopifyCredentialsConfig $credential,
         array $credentialAsArray,
-        $namespaceKeys,
+        $variant = null
     ): void {
         $storeloacleMapping = $credential->storelocaleMapping;
         if ($storeloacleMapping) {
             $commonFields = $this->getCommonFields($rowData);
-            foreach ($addedmetafields as $keydMeta => $addedMetaField) {
 
+            foreach ($addedmetafields as $keydMeta => $addedMetaField) {
                 $formatedVariable = [
                     'id'           => $addedMetaField['node']['id'],
                     'translations' => [],
                 ];
-                $namespaceKey = $addedMetaField['node']['namespace'].'.'.$addedMetaField['node']['key'];
 
                 foreach ($storeloacleMapping as $shopifyLocaleCode => $unopimLocaleCode) {
-                    if ($shopifyDefaultLocale == $unopimLocaleCode || empty($namespaceKeys[$namespaceKey])) {
+                    if ($shopifyDefaultLocale == $unopimLocaleCode || ! isset($parentValues[$keydMeta])) {
                         continue;
                     }
 
                     $channelLocaleSpecificFields = $this->getChannelLocaleSpecificFields($rowData, $channel, $unopimLocaleCode);
                     $localeSpecificFields = $this->getLocaleSpecificFields($rowData, $unopimLocaleCode);
                     $allData = array_merge($localeSpecificFields, $channelLocaleSpecificFields, $commonFields);
-                    $value = $allData[$namespaceKeys[$namespaceKey]] ?? '';
+                    $value = $allData[$parentValues[$keydMeta]] ?? '';
                     $jsonData = $addedMetaField['node']['value'];
                     $data = json_decode($jsonData, true);
+
                     if (is_array($data)) {
                         foreach ($data as $key => $value2) {
                             if (is_array($value2)) {
@@ -101,6 +101,7 @@ trait TranslationTrait
 
             foreach ($matchAttribute as $shopifyField => $unopimField) {
                 $defaultValue = $productData[$shopifyField] ?? '';
+
                 if ($shopifyField == 'metafields_global_title_tag') {
                     $defaultValue = $productData['seo']['title'] ?? '';
                     $shopifyField = 'meta_title';
@@ -139,6 +140,7 @@ trait TranslationTrait
 
             if ($formatedVariable) {
                 $response = $this->requestGraphQlApiAction('createTranslation', $credentialAsArray, $formatedVariable);
+
             }
         }
     }

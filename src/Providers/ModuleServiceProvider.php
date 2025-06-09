@@ -10,6 +10,5 @@ class ModuleServiceProvider extends CoreModuleServiceProvider
         \Webkul\Shopify\Models\ShopifyCredentialsConfig::class,
         \Webkul\Shopify\Models\ShopifyExportMappingConfig::class,
         \Webkul\Shopify\Models\ShopifyMappingConfig::class,
-        \Webkul\Shopify\Models\ShopifyMetaFieldsConfig::class,
     ];
 }

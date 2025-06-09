@@ -28,15 +28,10 @@ return [
         'params' => [3],
         'sort'   => 3,
     ], [
-        'key'    => 'shopify.meta-fields',
-        'name'   => 'shopify::app.components.layouts.sidebar.meta-fields',
-        'route'  => 'shopify.metafield.index',
-        'sort'   => 4,
-    ], [
         'key'    => 'shopify.settings',
         'name'   => 'shopify::app.components.layouts.sidebar.settings',
         'route'  => 'admin.shopify.settings',
         'params' => [2],
-        'sort'   => 5,
+        'sort'   => 4,
     ],
 ];
