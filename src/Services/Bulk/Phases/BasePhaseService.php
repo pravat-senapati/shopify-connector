@@ -35,6 +35,16 @@ abstract class BasePhaseService
 {
     use ShopifyGraphqlRequest;
 
+    /**
+     * Whether handle() should dispatch the async PollBulkShopifyOperation job
+     * for the phase bulk operation it creates.
+     *
+     * The async Run*Phase jobs leave this true (fire-and-forget polling). The
+     * synchronous, batch-scoped exporter pipeline sets it to false so it can
+     * poll the phase operation inline and keep the per-batch phase order strict.
+     */
+    public bool $dispatchPollJob = true;
+
     /** @var ShopifyCredential|null */
     protected $credential;
 
@@ -176,8 +186,11 @@ abstract class BasePhaseService
             ],
         ]);
 
-        // Dispatch poll job
-        PollBulkShopifyOperation::dispatch($phaseBulkOperation->id);
+        // Dispatch poll job (skipped when the caller polls the phase op inline,
+        // e.g. the synchronous per-batch exporter pipeline).
+        if ($this->dispatchPollJob) {
+            PollBulkShopifyOperation::dispatch($phaseBulkOperation->id);
+        }
 
         return [
             'processed' => count($lines),

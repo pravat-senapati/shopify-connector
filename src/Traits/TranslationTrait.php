@@ -40,7 +40,7 @@ trait TranslationTrait
                     'id' => $addedMetaField['node']['id'],
                     'translations' => [],
                 ];
-                $namespaceKey = $addedMetaField['node']['namespace'].'.'.$addedMetaField['node']['key'];
+                $namespaceKey = $addedMetaField['node']['namespace'] . '.' . $addedMetaField['node']['key'];
 
                 foreach ($storeloacleMapping as $shopifyLocaleCode => $unopimLocaleCode) {
                     if ($shopifyDefaultLocale == $unopimLocaleCode || empty($namespaceKeys[$namespaceKey])) {
@@ -58,7 +58,7 @@ trait TranslationTrait
                             if (is_array($value2)) {
                                 continue;
                             }
-                            $jsonData = '{ "'.$key.'": "'.$value2.'" }';
+                            $jsonData = '{ "' . $key . '": "' . $value2 . '" }';
                         }
                     }
 
@@ -259,6 +259,7 @@ trait TranslationTrait
                 'id' => $collectionResult['id'],
                 'translations' => [],
             ];
+
             foreach ($storeloacleMapping as $shopifyLocaleCode => $unopimLocaleCode) {
                 if ($locale == $unopimLocaleCode) {
                     continue;
@@ -284,7 +285,10 @@ trait TranslationTrait
                     'translatableContentDigest' => hash('sha256', $collectionResult['descriptionHtml'] ?? ''),
                 ];
             }
-            $this->requestGraphQlApiAction('createTranslation', $credentialAsArray, $formatedVariable);
+
+            if (!empty($formatedVariable['translations'])) {
+                $this->requestGraphQlApiAction('createTranslation', $credentialAsArray, $formatedVariable);
+            }
         }
     }
 }

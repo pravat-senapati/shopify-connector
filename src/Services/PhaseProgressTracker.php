@@ -79,6 +79,44 @@ class PhaseProgressTracker
     }
 
     /**
+     * UI hint: record the active batch ordinal together with the phase currently
+     * executing for it, so the tracker can show "Batch N - <phase>" in real time.
+     *
+     * Writes to JobTrack.summary (current_batch + current_phase). Both the async
+     * phase jobs (via markStarted) and the synchronous per-batch exporter pipeline
+     * feed this; the tracker UI polls JobTrack.summary every second.
+     */
+    public function markBatchPhaseStarted(?int $jobTrackId, ?int $batchNumber, string $phase, ?float $progress = null): void
+    {
+        if (! $jobTrackId) {
+            return;
+        }
+
+        DB::transaction(function () use ($jobTrackId, $batchNumber, $phase, $progress) {
+            $jobTrack = $this->lockJobTrack($jobTrackId);
+
+            if (! $jobTrack) {
+                return;
+            }
+
+            $summary = $jobTrack->summary ?? [];
+            $summary['current_phase'] = $phase;
+
+            if ($batchNumber !== null) {
+                $summary['current_batch'] = $batchNumber;
+            }
+
+            // Overall progress, distributed evenly across batches and the five
+            // phases within each batch, so the tracker bar advances per phase.
+            if ($progress !== null) {
+                $summary['phase_progress'] = $progress;
+            }
+
+            $this->jobTrackRepository->update(['summary' => $summary], $jobTrackId);
+        });
+    }
+
+    /**
      * Decrement a core op's counter when a phase work unit settles.
      *
      * If the JobTrack-wide total reaches zero AND no other core ops are still

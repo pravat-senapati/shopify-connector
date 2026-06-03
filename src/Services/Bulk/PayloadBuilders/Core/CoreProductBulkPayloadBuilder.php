@@ -5,10 +5,7 @@ namespace Webkul\Shopify\Services\Bulk\PayloadBuilders\Core;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Webkul\Attribute\Repositories\AttributeRepository;
-use Webkul\DataTransfer\Contracts\JobTrack as JobTrackContract;
-use Webkul\DataTransfer\Helpers\Export;
 use Webkul\Product\Services\ProductValueMapper;
-use Webkul\Shopify\Exceptions\InvalidCredential;
 use Webkul\Shopify\Helpers\Exporters\Product\ShopifyGraphQLDataFormatter;
 use Webkul\Shopify\Repositories\ShopifyCredentialRepository;
 use Webkul\Shopify\Repositories\ShopifyExportMappingRepository;
@@ -53,10 +50,10 @@ class CoreProductBulkPayloadBuilder
     /**
      * Build JSONL lines and manifest payload for a batch.
      */
-    public function build(array $filters, array $batchRows, JobTrackContract $jobTrack): array
+    public function build(array $filters, array $batchRows, int $jobTrackId): array
     {
-        $this->initialize($filters, $jobTrack);
-        $jobTrackId = $jobTrack->id;
+        $this->initialize($filters);
+
         $products = $this->fetchProducts($batchRows);
         $groupedProducts = $this->groupProducts($products);
 
@@ -111,21 +108,11 @@ class CoreProductBulkPayloadBuilder
     /**
      * Initialize context for payload generation.
      */
-    protected function initialize(array $filters, JobTrackContract $jobTrack): void
+    protected function initialize(array $filters): void
     {
         $this->currency = $filters['currency'] ?? null;
         $this->jobChannel = $filters['channel'] ?? null;
-        $this->credential = $this->shopifyCredentialRepository->find($filters['credentials'] ?? null);
-
-        if (! $this->credential?->active) {
-            $jobTrack->state = Export::STATE_FAILED;
-
-            $jobTrack->errors = [trans('shopify::app.shopify.export.errors.invalid-credential')];
-            $jobTrack->save();
-
-            throw new InvalidCredential;
-        }
-
+        $this->credential = $this->shopifyCredentialRepository->find($filters['credentials']);
         $mappings = $this->shopifyExportMappingRepository->findMany([1, 2]);
 
         $this->exportMapping = $mappings->first();

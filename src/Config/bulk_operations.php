@@ -5,6 +5,14 @@ return [
     'dispatch_followup_phases' => true,
 
     /*
+    | Hard cap (seconds) the synchronous, batch-scoped export pipeline waits for
+    | any single Shopify bulk operation (core or phase) to finish before giving
+    | up on it and moving on. Prevents a stuck Shopify op from holding the
+    | per-export batch lock forever.
+    */
+    'sync_pipeline_max_wait_seconds' => 1800,
+
+    /*
     | Import-side bulk-operation tuning. The product importer can fetch the
     | catalog via Shopify's bulkOperationRunQuery (one round trip) instead of
     | thousands of paginated GraphQL calls.

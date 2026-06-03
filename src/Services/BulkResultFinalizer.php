@@ -26,8 +26,13 @@ class BulkResultFinalizer
 
     /**
      * Finalize a completed Shopify bulk operation by syncing local mappings or phase results.
+     *
+     * @param  bool  $dispatchFollowUps  When false, the core finalizer syncs mappings
+     *                                    but does NOT dispatch the follow-up phase jobs.
+     *                                    The synchronous per-batch exporter pipeline runs
+     *                                    those phases itself, in order, so it opts out here.
      */
-    public function finalize(object $bulkOperation, array $manifest): void
+    public function finalize(object $bulkOperation, array $manifest, bool $dispatchFollowUps = true): void
     {
         $resultPath = $bulkOperation->result_file_path;
 
@@ -42,7 +47,7 @@ class BulkResultFinalizer
 
         // For core product sync (phase = 'core_product_sync' or empty), perform mapping sync and dispatch follow-up phases
         if (empty($phase) || $phase === BulkOperationService::CORE_PRODUCT_PHASE) {
-            $this->finalizeCoreProductSync($bulkOperation, $manifest, $results);
+            $this->finalizeCoreProductSync($bulkOperation, $manifest, $results, $dispatchFollowUps);
         } else {
             $this->finalizePhaseOperation($bulkOperation, $manifest, $results);
         }
@@ -51,7 +56,7 @@ class BulkResultFinalizer
     /**
      * Finalize core productSet bulk operation: sync product/variant mappings.
      */
-    protected function finalizeCoreProductSync(ShopifyBulkOperation $bulkOperation, array $manifest, array $results): void
+    protected function finalizeCoreProductSync(ShopifyBulkOperation $bulkOperation, array $manifest, array $results, bool $dispatchFollowUps = true): void
     {
         $manifestLines = $manifest['lines'] ?? [];
         $shopUrl = $manifest['shop_url'] ?? null;
@@ -151,9 +156,15 @@ class BulkResultFinalizer
 
         $this->markBatchProcessed($bulkOperation, $success, count($failed));
 
-        // Dispatch follow-up phases
+        // Persist the follow-up context regardless; it is read by the phase services.
         $this->phaseOrchestrator->registerPendingPhases($bulkOperation, $manifest['follow_up_context'] ?? []);
-        $this->phaseOrchestrator->dispatchPendingPhases($bulkOperation);
+
+        // Dispatch follow-up phases asynchronously only when the caller asks for it.
+        // The synchronous per-batch exporter pipeline runs the phases itself, in
+        // strict order, so it passes $dispatchFollowUps = false here.
+        if ($dispatchFollowUps) {
+            $this->phaseOrchestrator->dispatchPendingPhases($bulkOperation);
+        }
     }
 
     /**

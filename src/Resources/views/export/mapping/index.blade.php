@@ -1,17 +1,16 @@
 <x-admin::layouts.with-history>
     <x-slot:entityName>
         shopify_exportmapping
-    </x-slot>
-    <x-slot:title>
-        @lang('shopify::app.shopify.export.mapping.title')
-    </x-slot>
-    <v-create-attributes-mappings></v-create-attributes-mappings>
-    @pushOnce('scripts')
-    <script
-        type="text/x-template"
-        id="v-create-attributes-mapping-template"
-    >
-        <x-admin::form  
+        </x-slot>
+        <x-slot:title>
+            @lang('shopify::app.shopify.export.mapping.title')
+            </x-slot>
+            <v-create-attributes-mappings></v-create-attributes-mappings>
+            @pushOnce('scripts')
+            <script
+                type="text/x-template"
+                id="v-create-attributes-mapping-template">
+                <x-admin::form  
             :action="route('shopify.export-mappings.create')" enctype="multipart/form-data"
         >
         @method('POST')
@@ -91,24 +90,22 @@
                                     />
                                     <x-admin::form.control-group.error control-name="{{ $field['name'] }}" />
                                 </x-admin::form.control-group>
-                                <x-admin::form.control-group class="!mb-0">
-                                    <x-admin::form.control-group.control
-                                        type="text"
-                                        :name="'default_' . $field['name']"
-                                        :id="'default_' . $field['name']"
-                                        :value="old('default_' . $field['name']) ?? $defaultValue"
-                                        :placeholder="trans($field['label'])"
-                                        ::asc="isFieldDisabled('{{ $value }}', 'default_' + '{{ $field['name'] }}')"
-                                        ::disabled="disabledFields['default_' + '{{ $field['name'] }}']"
-                                                
-                                    />
-                                    
-                                    <x-admin::form.control-group.error :control-name="'default_' . $field['name']" />
-                                </x-admin::form.control-group>
+                                @if($fields !== 'handle')
+                                    <x-admin::form.control-group class="!mb-0">
+                                        <x-admin::form.control-group.control
+                                            type="text"
+                                            :name="'default_' . $field['name']"
+                                            :id="'default_' . $field['name']"
+                                            :value="old('default_' . $field['name']) ?? $defaultValue"
+                                            :placeholder="trans($field['label'])"
+                                            ::asc="isFieldDisabled('{{ $value }}', 'default_' + '{{ $field['name'] }}')"
+                                            ::disabled="disabledFields['default_' + '{{ $field['name'] }}']"
+                                        />
+                                        <x-admin::form.control-group.error :control-name="'default_' . $field['name']" />
+                                    </x-admin::form.control-group>
+                                @endif
                             </div>
                         @endforeach
-     
-                        
                     </div>
 
                     <!----- Image mappings ---->
@@ -274,65 +271,64 @@
             </div>
         </x-admin::form>
     </script>
-    <script type="module">
-        app.component('v-create-attributes-mappings', {
-            template: '#v-create-attributes-mapping-template',
-            data() {
-                return {
-                    disabledFields: {},
-                    onchange: {},
-                    selectedAttributeType: @json($mediaType ?? null),
-                };
-            },
-            watch: {
-                selectedAttributeType(value) {
-                    this.$refs.mediaAttributes.selectedValue = [];
-                }
-            },
-            methods: {
-                isDisabled(){
-                   
-                    if (this.$refs['mediaType'] && !this.$refs['mediaType'].selectedValue) 
-                    {
-                     this.$refs['mediaAttributes'].selectedValue = null;
-                     
-                     return true
+            <script type="module">
+                app.component('v-create-attributes-mappings', {
+                    template: '#v-create-attributes-mapping-template',
+                    data() {
+                        return {
+                            disabledFields: {},
+                            onchange: {},
+                            selectedAttributeType: @json($mediaType ?? null),
+                        };
+                    },
+                    watch: {
+                        selectedAttributeType(value) {
+                            this.$refs.mediaAttributes.selectedValue = [];
+                        }
+                    },
+                    methods: {
+                        isDisabled() {
+
+                            if (this.$refs['mediaType'] && !this.$refs['mediaType'].selectedValue) {
+                                this.$refs['mediaAttributes'].selectedValue = null;
+
+                                return true
+                            }
+
+                            return false
+                        },
+                        handleDependentChange(fieldName, dependentFieldName) {
+                            let value = this.$refs[fieldName].selectedOption;
+                            this.$refs[dependentFieldName].params[fieldName] = value;
+                            console.log(fieldName, value);
+                            this.$refs[dependentFieldName].optionsList = '';
+                        },
+
+                        handleSelectChange(event, fieldName) {
+                            var defaultFieldName = 'default_' + fieldName;
+
+                            if (!event) {
+                                this.onchange[defaultFieldName] = false;
+                            } else {
+                                this.onchange[defaultFieldName] = true;
+                            }
+                        },
+
+                        isFieldDisabled(value, defaultFieldName) {
+                            this.disabledFields[defaultFieldName] = true;
+
+                            if (value == 'null' || value == '' || !value) {
+                                this.disabledFields[defaultFieldName] = false;
+                            }
+
+                            if (Object.keys(this.onchange).length != 0) {
+                                Object.keys(this.onchange).forEach(key => {
+                                    this.disabledFields[key] = this.onchange[key];
+                                });
+                            }
+                        }
                     }
-
-                    return false
-                },
-                handleDependentChange(fieldName, dependentFieldName) {
-                    let value = this.$refs[fieldName].selectedOption;
-                    this.$refs[dependentFieldName].params[fieldName] = value;
-                    console.log(fieldName, value);
-                    this.$refs[dependentFieldName].optionsList = '';
-                },
-                
-                handleSelectChange(event, fieldName) {
-                    var defaultFieldName = 'default_' + fieldName;
-
-                    if (!event) {
-                        this.onchange[defaultFieldName] = false;
-                    } else {
-                        this.onchange[defaultFieldName] = true;
-                    }
-                },
-
-                isFieldDisabled(value, defaultFieldName) {
-                    this.disabledFields[defaultFieldName] = true;
-
-                    if (value == 'null' || value == '' || !value) {
-                        this.disabledFields[defaultFieldName] = false;  
-                    }
-
-                    if (Object.keys(this.onchange).length != 0) {
-                        Object.keys(this.onchange).forEach(key => {
-                            this.disabledFields[key] = this.onchange[key];
-                        });
-                    }    
-                }
-            }
-        });
-    </script>
-    @endPushOnce
+                });
+            </script>
+            @endPushOnce
 </x-admin::layouts.with-history>

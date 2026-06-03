@@ -18,16 +18,26 @@ use Webkul\DataTransfer\Helpers\Export as ExportHelper;
 use Webkul\DataTransfer\Helpers\Exporters\AbstractExporter;
 use Webkul\DataTransfer\Jobs\Export\File\FlatItemBuffer as FileExportFileBuffer;
 use Webkul\DataTransfer\Repositories\JobTrackBatchRepository;
+use Webkul\Shopify\Exceptions\BulkMutationInProgressException;
 use Webkul\Shopify\Exceptions\InvalidCredential;
 use Webkul\Shopify\Exceptions\InvalidLocale;
-use Webkul\Shopify\Jobs\PollBulkShopifyOperation;
+use Webkul\Shopify\Models\ShopifyBulkOperation;
 use Webkul\Shopify\Repositories\ShopifyBulkOperationRepository;
 use Webkul\Shopify\Repositories\ShopifyCredentialRepository;
 use Webkul\Shopify\Repositories\ShopifyExportMappingRepository;
 use Webkul\Shopify\Repositories\ShopifyMappingRepository;
 use Webkul\Shopify\Repositories\ShopifyMetaFieldRepository;
 use Webkul\Shopify\Services\Bulk\PayloadBuilders\Core\CoreProductBulkPayloadBuilder;
+use Webkul\Shopify\Services\Bulk\Phases\BasePhaseService;
+use Webkul\Shopify\Services\Bulk\Phases\Export\CollectionAssignmentPhaseService;
+use Webkul\Shopify\Services\Bulk\Phases\Export\InventoryPhaseService;
+use Webkul\Shopify\Services\Bulk\Phases\Export\MediaPhaseService;
+use Webkul\Shopify\Services\Bulk\Phases\Export\PublishingPhaseService;
+use Webkul\Shopify\Services\Bulk\Phases\Export\TranslationPhaseService;
+use Webkul\Shopify\Services\BulkOperationResultReader;
 use Webkul\Shopify\Services\BulkOperationService;
+use Webkul\Shopify\Services\BulkResultFinalizer;
+use Webkul\Shopify\Services\PhaseProgressTracker;
 use Webkul\Shopify\Traits\DataMappingTrait;
 use Webkul\Shopify\Traits\ShopifyGraphqlRequest;
 use Webkul\Shopify\Traits\TranslationTrait;
@@ -60,7 +70,63 @@ class Exporter extends AbstractExporter
 
     protected $imageData = [];
 
-    public const BATCH_SIZE = 500;
+    public const BATCH_SIZE = 1;
+
+    /**
+     * Follow-up phases run for each batch, in the exact order they must execute
+     * once the core product creation completes. Each entry maps the phase name
+     * (matching the phase service's getPhaseName()) to the service class that
+     * backs the corresponding Run*Phase job:
+     *
+     *   inventory    => Webkul\Shopify\Jobs\RunInventoryPhase
+     *   publishing   => Webkul\Shopify\Jobs\RunPublishingPhase
+     *   collections  => Webkul\Shopify\Jobs\RunCollectionAssignmentPhase
+     *   translations => Webkul\Shopify\Jobs\RunTranslationPhase
+     *   media        => Webkul\Shopify\Jobs\RunMediaPhase
+     *
+     * They are executed synchronously and in sequence so a batch is fully
+     * processed (core + every phase) before the next batch begins.
+     */
+    protected array $batchPhasePipeline = [
+        'inventory'    => InventoryPhaseService::class,
+        'publishing'   => PublishingPhaseService::class,
+        'collections'  => CollectionAssignmentPhaseService::class,
+        'translations' => TranslationPhaseService::class,
+        'media'        => MediaPhaseService::class,
+    ];
+
+    /**
+     * 1-based ordinal of the batch currently being processed, surfaced to the
+     * tracker UI as "Batch N - <phase>".
+     */
+    protected ?int $currentBatchNumber = null;
+
+    /**
+     * Total batches in this export, cached for progress math.
+     */
+    protected ?int $totalBatchCount = null;
+
+    /**
+     * Number of progress steps each batch is divided into. Collection assignment
+     * and translation are intentionally collapsed into a single step, matching
+     * the five-phase progress model shown in the tracker:
+     *   1 Product Creation, 2 Inventory, 3 Publishing,
+     *   4 Translation / Collection Assignment, 5 Media.
+     */
+    public const PHASE_STEPS_PER_BATCH = 5;
+
+    /**
+     * Maps each pipeline phase to its 1-based progress step within a batch.
+     * 'collections' and 'translations' share step 4 so they count once.
+     */
+    protected array $phaseProgressSteps = [
+        'product'      => 1,
+        'inventory'    => 2,
+        'publishing'   => 3,
+        'collections'  => 4,
+        'translations' => 4,
+        'media'        => 5,
+    ];
 
     /**
      * @var array
@@ -283,47 +349,37 @@ class Exporter extends AbstractExporter
     }
 
     /**
-     * Submit a Shopify bulk core product sync for the whole export.
+     * Process a single export batch end-to-end, batch by batch.
      *
-     * Shopify permits only one bulk mutation per app+shop at a time. A catalog
-     * larger than BATCH_SIZE is split into several export batches that run
-     * concurrently — if each submitted its own bulk op they would collide with
-     * "a bulk mutation operation for this app and shop is already in progress".
-     *
-     * Instead, the first batch to acquire the lock submits a single bulk op
-     * covering the entire export; every other batch finds that op already
-     * recorded and no-ops. Shopify bulk operations are designed to ingest a
-     * full catalog in one JSONL file, so one op per export is the correct unit.
+     * Shopify permits only one bulk mutation per app+shop at a time, and the
+     * desired flow is strictly batch-scoped: a batch must finish its complete
+     * pipeline — core product creation followed by every follow-up phase, in
+     * order — before the next batch starts. The export framework dispatches the
+     * batches as a concurrent Bus::batch, so we serialize them here with a
+     * per-export lock: each batch holds the lock while it submits its core bulk
+     * op and runs all of its phases synchronously, then releases it so the next
+     * batch can begin. This keeps everything inside the Shopify package and
+     * needs no change to the UnoPim core.
      */
     protected function exportCoreProductsInBulk(JobTrackBatchContract $batch): void
     {
-        $lock = Cache::lock('shopify-core-bulk-'.$this->export->id, 600);
+        $lockKey = 'shopify-core-bulk-pipeline-' . $this->export->id;
+
+        // TTL must comfortably exceed a single batch pipeline; block() waits for
+        // our turn while another batch holds the lock.
+        $lock = Cache::lock($lockKey, 14400);
 
         try {
-            $lock->block(90);
+            $lock->block(14400, function () use ($batch) {
+                $this->submitCoreBulkOperation($batch);
+            });
         } catch (LockTimeoutException $e) {
-            // Another batch is still submitting the export-wide bulk op; its
-            // JSONL already covers this batch's products, so nothing to do.
-            $this->markBatchAsNoOp($batch->id);
-
-            return;
-        }
-
-        try {
-            $existingOperation = $this->shopifyBulkOperationRepository
-                ->where('job_track_id', $this->export->id)
-                ->where('phase', BulkOperationService::CORE_PRODUCT_PHASE)
-                ->first();
-
-            if ($existingOperation) {
-                $this->markBatchAsNoOp($batch->id);
-
-                return;
-            }
+            $this->jobLogger?->warning(sprintf(
+                'Timed out waiting for the Shopify batch pipeline lock on batch %s; processing it without strict serialization.',
+                $batch->id
+            ));
 
             $this->submitCoreBulkOperation($batch);
-        } finally {
-            $lock->release();
         }
     }
 
@@ -368,11 +424,17 @@ class Exporter extends AbstractExporter
     }
 
     /**
-     * Build and submit the single export-wide core bulk operation.
+     * Build and submit this batch's core bulk operation, then run all of its
+     * follow-up phases — in order — before returning.
      */
     protected function submitCoreBulkOperation(JobTrackBatchContract $batch): void
     {
-        $payload = $this->coreProductBulkPayloadBuilder->build($this->getFilters(), $this->getAllCoreBatchRows(), $this->export);
+        // Surface "Batch N - Product Creation" to the tracker UI before the core
+        // bulk op even starts, then update the phase as the pipeline advances.
+        $this->currentBatchNumber = $this->resolveBatchNumber($batch);
+        $this->markBatchPhase('product');
+
+        $payload = $this->coreProductBulkPayloadBuilder->build($this->getFilters(), $this->getAllCoreBatchRows($batch), $this->export->id);
         // Do NOT seed batch summary with the builder's line count — that's
         // "submitted to Shopify", not "accepted by Shopify". For a 10k-product
         // bulk op the gap is minutes, during which the UI would show 10000 as
@@ -387,13 +449,15 @@ class Exporter extends AbstractExporter
         }
 
         $basePath = sprintf('shopify/bulk/%s/%s', $this->export->id, $batch->id);
-        $jsonlPath = $basePath.'/input.jsonl';
-        $manifestPath = $basePath.'/manifest.json';
+        $jsonlPath = $basePath . '/input.jsonl';
+        $manifestPath = $basePath . '/manifest.json';
         $jsonlFileName = sprintf('shopify-products-%s-%s.jsonl', $this->export->id, $batch->id);
 
         $jsonlAbsolutePath = $this->bulkOperationService->writeJsonl($jsonlPath, $payload['lines']);
         $this->bulkOperationService->writeManifest($manifestPath, $payload['manifest']);
+
         $uploadTarget = $this->bulkOperationService->createJsonlUploadTarget($payload['credential'], $jsonlFileName);
+
         if (empty($uploadTarget)) {
             throw new \RuntimeException(json_encode([['message' => 'Unable to create Shopify bulk upload target.']]));
         }
@@ -404,7 +468,6 @@ class Exporter extends AbstractExporter
         $operationResponse = $this->bulkOperationService->runMutation($payload['credential'], $mutation, $stagedUploadPath);
         $operationErrors = $operationResponse['userErrors'] ?? [];
         $bulkOperationData = $operationResponse['bulkOperation'] ?? [];
-
         if (! empty($operationErrors) || empty($bulkOperationData['id'])) {
             throw new \RuntimeException(json_encode($operationErrors ?: [['message' => 'Unable to start Shopify bulk core sync.']]));
         }
@@ -425,50 +488,301 @@ class Exporter extends AbstractExporter
             ],
         ]);
 
-        PollBulkShopifyOperation::dispatch($bulkOperation->id)->delay(
-            now()->addSeconds((int) config('shopify-bulk-operations.poll_delay_seconds', 20))
-        );
-
-        // Winner batch: mark state processed with zero summary. BulkResultFinalizer
-        // is the single source of truth for the real created/processed counts on
-        // this batch — going through updateBatchState() here would risk picking up
-        // a polluted cumulative count from job_track.summary (see markBatchAsNoOp
-        // for the loser-side reasoning; the race is symmetric).
-        $this->markBatchAsNoOp($batch->id);
-
         $this->jobLogger?->info(sprintf(
             'Shopify bulk core sync submitted. Operation: %s. Batch: %s.',
             $bulkOperationData['id'],
             $batch->id
         ));
+
+        // Immediately after creating the bulk operation record, drive this batch
+        // through the rest of its pipeline: wait for core product creation to
+        // finish on Shopify, then run every follow-up phase in order for this
+        // batch only. We do not wait for any other batch's product creation —
+        // the per-export lock in exportCoreProductsInBulk guarantees the next
+        // batch starts only after this one's phases are done.
+        $this->runBatchPipeline($bulkOperation);
+
+        // Mark state processed with the batch's slice count. BulkResultFinalizer
+        // is the single source of truth for the real created/processed counts on
+        // this batch — going through updateBatchState() here would risk picking up
+        // a polluted cumulative count from job_track.summary (see markBatchAsNoOp
+        // for the loser-side reasoning; the race is symmetric).
+        $this->markBatchAsNoOp($batch->id);
     }
 
     /**
-     * Collect every root product row for this export as core batch rows.
+     * Drive one batch through its full pipeline synchronously, in order:
      *
-     * The export-wide bulk op covers the whole catalog regardless of how the
-     * framework split it into batches, so its payload is built from all root
-     * SKUs rather than a single batch's slice. Mirrors getResults()'s filter.
+     *   1. Product creation (core productSet) — already submitted by the caller
+     *   2. Inventory   (RunInventoryPhase)
+     *   3. Publishing  (RunPublishingPhase)
+     *   4. Collections (RunCollectionAssignmentPhase)
+     *   5. Translation (RunTranslationPhase)
+     *   6. Media       (RunMediaPhase)
+     *
+     * Each step waits for its Shopify bulk operation to complete before the next
+     * starts, so the whole thing is strictly batch-scoped.
+     */
+    protected function runBatchPipeline(ShopifyBulkOperation $coreBulkOperation): void
+    {
+        // 1. Wait for the core productSet bulk op to finish, then finalize it
+        //    (sync product/variant mappings). Suppress the finalizer's own async
+        //    follow-up dispatch — we run the phases ourselves, in order, below.
+        $coreBulkOperation = $this->waitForBulkOperationToComplete($coreBulkOperation->id);
+
+        if (! $coreBulkOperation || strtoupper((string) $coreBulkOperation->shopify_status) !== 'COMPLETED') {
+            $this->jobLogger?->warning('Shopify core product creation did not complete; skipping this batch\'s follow-up phases.');
+
+            return;
+        }
+
+        $coreManifest = $this->bulkOperationService->readManifest($coreBulkOperation->input_file_path);
+        app(BulkResultFinalizer::class)->finalize($coreBulkOperation, $coreManifest, false);
+
+        $coreBulkOperation = $this->shopifyBulkOperationRepository->find($coreBulkOperation->id);
+
+        // 2..6 Run every follow-up phase in the required order. Each phase reads
+        //       this batch's core result, so the data is fully batch-scoped.
+        $operationData = app(BulkOperationResultReader::class)->read($coreBulkOperation);
+
+        foreach ($this->batchPhasePipeline as $phaseName => $serviceClass) {
+            $this->runPhaseForBatch($coreBulkOperation, $serviceClass, $phaseName, $operationData);
+        }
+    }
+
+    /**
+     * Execute a single follow-up phase for a batch and wait for it to complete.
+     *
+     * Mirrors the matching Run*Phase job, but runs the phase service inline with
+     * async polling disabled so the per-batch order stays strict.
+     */
+    protected function runPhaseForBatch(
+        ShopifyBulkOperation $coreBulkOperation,
+        string $serviceClass,
+        string $phaseName,
+        array $operationData
+    ): void {
+        // Surface "Batch N - <phase>" to the tracker UI as this phase begins.
+        $this->markBatchPhase($phaseName);
+
+        /** @var BasePhaseService $service */
+        $service = app($serviceClass);
+
+        // Poll the phase bulk op inline rather than handing it to the async job.
+        $service->dispatchPollJob = false;
+
+        try {
+            $result = $service->handle($coreBulkOperation, $operationData);
+        } catch (BulkMutationInProgressException $e) {
+            // Should not happen while we hold the per-export lock (one bulk op at
+            // a time), but stay defensive rather than dropping the phase.
+            $this->jobLogger?->warning(sprintf(
+                'Shopify %s phase reported the bulk-mutation slot busy: %s',
+                $phaseName,
+                $e->getMessage()
+            ));
+
+            return;
+        }
+
+        $phaseOperationId = $result['phase_bulk_operation_id'] ?? null;
+
+        // A phase with nothing to do (not applicable, or no pending data) returns
+        // no operation id — there is nothing to wait for, move to the next phase.
+        if (empty($phaseOperationId)) {
+            return;
+        }
+
+        $phaseOperation = $this->waitForBulkOperationToComplete($phaseOperationId);
+
+        if (! $phaseOperation || strtoupper((string) $phaseOperation->shopify_status) !== 'COMPLETED') {
+            $this->jobLogger?->warning(sprintf(
+                'Shopify %s phase did not complete for batch core operation %s.',
+                $phaseName,
+                $coreBulkOperation->id
+            ));
+
+            return;
+        }
+
+        $phaseManifest = $this->bulkOperationService->readManifest($phaseOperation->input_file_path);
+        app(BulkResultFinalizer::class)->finalize($phaseOperation, $phaseManifest);
+    }
+
+    /**
+     * Poll a Shopify bulk operation until it reaches a terminal state, mirroring
+     * PollBulkShopifyOperation but synchronously. On COMPLETED the result file is
+     * downloaded and recorded. Returns the refreshed record, or null on
+     * failure/timeout.
+     */
+    protected function waitForBulkOperationToComplete(int $bulkOperationId): ?ShopifyBulkOperation
+    {
+        $bulkOperation = $this->shopifyBulkOperationRepository->find($bulkOperationId);
+
+        if (! $bulkOperation || empty($bulkOperation->shopify_bulk_operation_id)) {
+            return null;
+        }
+
+        $credential = $this->shopifyRepository->find($bulkOperation->credential_id);
+
+        if (! $credential) {
+            return null;
+        }
+
+        $credentialArray = $credential->toApiArray();
+
+        $delay = max(1, (int) config('shopify-bulk-operations.poll_delay_seconds', 5));
+        $maxWait = max($delay, (int) config('shopify-bulk-operations.sync_pipeline_max_wait_seconds', 1800));
+        $waited = 0;
+
+        while (true) {
+            $operationState = $this->bulkOperationService->getOperation(
+                $credentialArray,
+                $bulkOperation->shopify_bulk_operation_id
+            );
+
+            $status = strtoupper((string) ($operationState['status'] ?? ''));
+
+            $update = [
+                'shopify_status'   => strtolower($operationState['status'] ?? 'unknown'),
+                'error_code'       => $operationState['errorCode'] ?? null,
+                'result_url'       => $operationState['url'] ?? null,
+                'partial_data_url' => $operationState['partialDataUrl'] ?? null,
+                'object_count'     => isset($operationState['objectCount']) ? (int) $operationState['objectCount'] : null,
+                'file_size'        => isset($operationState['fileSize']) ? (int) $operationState['fileSize'] : null,
+                'status'           => $this->mapBulkOperationStatus($status),
+            ];
+
+            if (in_array($status, ['COMPLETED', 'FAILED', 'CANCELED'], true)) {
+                $resultUrl = $operationState['url'] ?? $operationState['partialDataUrl'] ?? null;
+
+                if ($status === 'COMPLETED' && $resultUrl) {
+                    $resultStoragePath = sprintf(
+                        'shopify/bulk/%s/%s/result.jsonl',
+                        $bulkOperation->job_track_id,
+                        $bulkOperation->id
+                    );
+
+                    $this->bulkOperationService->downloadResult($resultUrl, $resultStoragePath);
+                    $update['result_file_path'] = $resultStoragePath;
+                }
+
+                $this->shopifyBulkOperationRepository->update($update, $bulkOperation->id);
+
+                return $this->shopifyBulkOperationRepository->find($bulkOperation->id);
+            }
+
+            $this->shopifyBulkOperationRepository->update($update, $bulkOperation->id);
+
+            $waited += $delay;
+
+            if ($waited >= $maxWait) {
+                $this->jobLogger?->warning(sprintf(
+                    'Timed out after %ds waiting for Shopify bulk operation %s.',
+                    $maxWait,
+                    $bulkOperation->shopify_bulk_operation_id
+                ));
+
+                return null;
+            }
+
+            sleep($delay);
+        }
+    }
+
+    /**
+     * Map a Shopify bulk operation status to the local status column value.
+     */
+    protected function mapBulkOperationStatus(string $status): string
+    {
+        return match ($status) {
+            'COMPLETED' => 'completed',
+            'FAILED'    => 'failed',
+            'CANCELED'  => 'cancelled',
+            default     => 'running',
+        };
+    }
+
+    /**
+     * Resolve the 1-based ordinal of a batch within its export (ordered by id),
+     * so the tracker can label progress "Batch 1", "Batch 2", … "Batch N".
+     */
+    protected function resolveBatchNumber(JobTrackBatchContract $batch): int
+    {
+        return (int) $this->export->batches()
+            ->where('id', '<=', $batch->id)
+            ->count();
+    }
+
+    /**
+     * Record the phase currently executing for the active batch on the JobTrack
+     * summary, which the tracker UI polls to render "Batch N - <phase>" live,
+     * together with the overall progress percentage for that phase.
+     */
+    protected function markBatchPhase(string $phase): void
+    {
+        app(PhaseProgressTracker::class)->markBatchPhaseStarted(
+            (int) $this->export->id,
+            $this->currentBatchNumber,
+            $phase,
+            $this->calculatePhaseProgress($phase)
+        );
+    }
+
+    /**
+     * Overall progress (0-100) when a given phase of the active batch starts.
+     *
+     * Each batch owns an equal share of the bar (100 / totalBatches), and that
+     * share is split evenly across the five phase steps. Reaching phase step P
+     * of batch B (both 1-based) sets:
+     *
+     *   progress = ((B - 1) * 5 + P) / (totalBatches * 5) * 100
+     *
+     * e.g. with 2 batches: Batch 1 Product = 10%, Batch 1 Media = 50%,
+     * Batch 2 Product = 60%, Batch 2 Media = 100%.
+     */
+    protected function calculatePhaseProgress(string $phase): ?float
+    {
+        $total = $this->totalBatchCount ??= (int) $this->export->batches()->count();
+        $step = $this->phaseProgressSteps[$phase] ?? null;
+
+        if (! $total || ! $this->currentBatchNumber || $step === null) {
+            return null;
+        }
+
+        $globalStep = ($this->currentBatchNumber - 1) * self::PHASE_STEPS_PER_BATCH + $step;
+        $totalSteps = $total * self::PHASE_STEPS_PER_BATCH;
+
+        return round(min(100, ($globalStep / $totalSteps) * 100), 2);
+    }
+
+    /**
+     * Collect the root product rows for the current batch as core batch rows.
+     *
+     * For bulk export, each batch is submitted as an independent Shopify bulk
+     * operation covering only the products in that batch's slice. The SKUs are
+     * taken from `$batch->data` so the payload is scoped to the current batch
+     * rather than the whole catalog. Mirrors getResults()'s root filter.
      *
      * @return array<int, array{sku: string}>
      */
-    protected function getAllCoreBatchRows(): array
+    protected function getAllCoreBatchRows(JobTrackBatchContract $batch): array
     {
-        $filters = $this->getFilters();
+        $skus = array_column($batch->data, 'sku');
+
+        if (empty($skus)) {
+            return [];
+        }
 
         $query = DB::table('products')
             ->select('sku')
+            ->whereIn('sku', $skus)
             ->where(function ($q) {
                 $q->whereNull('parent_id')->orWhere('parent_id', 0);
             });
 
-        if (! empty($filters['productfilter'])) {
-            $skus = array_map('trim', explode(',', $filters['productfilter']));
-            $query->whereIn('sku', $skus);
-        }
-
         return $query->get()
-            ->map(fn ($row) => ['sku' => $row->sku])
+            ->map(fn($row) => ['sku' => $row->sku])
             ->all();
     }
 
@@ -833,7 +1147,7 @@ class Exporter extends AbstractExporter
      * */
     public function updateSalesChannelPublishing(string $productId, array $existingPublicationId, array $publicationsIds, array $credential): void
     {
-        $existingIds = array_map(fn ($item) => $item['node']['publication']['id'], $existingPublicationId);
+        $existingIds = array_map(fn($item) => $item['node']['publication']['id'], $existingPublicationId);
         $newIds = array_column($publicationsIds, 'publicationId');
         sort($existingIds);
         sort($newIds);
@@ -845,7 +1159,7 @@ class Exporter extends AbstractExporter
             $this->requestGraphQlApiAction('productPublish', $credential, ['input' => $productPublishFormate]);
             $removePublication = array_values(array_diff($existingIds, $newIds));
             if (! empty($removePublication)) {
-                $removePublicationIds = array_map(fn ($id) => ['publicationId' => $id], $removePublication);
+                $removePublicationIds = array_map(fn($id) => ['publicationId' => $id], $removePublication);
                 $this->updateSalesChannelUnpublishing($productId, $removePublicationIds, $credential);
             }
         }
@@ -1392,7 +1706,7 @@ class Exporter extends AbstractExporter
             if (in_array('FILE_DOES_NOT_EXIST', $errorCode)) {
                 preg_match('/^File ids \[(.*?)\]/', $errors[0]['message'], $matches);
                 if (! empty($matches[1])) {
-                    $fileIds = json_decode('['.$matches[1].']', true);
+                    $fileIds = json_decode('[' . $matches[1] . ']', true);
                     $this->deleteProductMediaMapping($fileIds);
                 }
             }
@@ -1616,9 +1930,12 @@ class Exporter extends AbstractExporter
             $translationsOption = $optionvalues['translations'];
             $name = $optionvalues['code'];
             if (isset($this->settingMapping->mapping['option_name_label']) && $this->settingMapping->mapping['option_name_label']) {
-                $name = array_column(array_filter($translationsOption, fn ($item) => $item['locale'] === $shopifyDefaultLocale), 'name')[0] ?? $optionvalues['name'];
+                $name = array_column(array_filter($translationsOption, fn($item) => $item['locale'] === $shopifyDefaultLocale), 'name')[0] ?? $optionvalues['name'];
             }
 
+            if (! array_key_exists($optionvalues['code'], $mergedFields)) {
+                continue;
+            }
             if ($key < 3) {
                 $options = [
                     'name' => $name,
@@ -1862,7 +2179,7 @@ class Exporter extends AbstractExporter
             $ids = explode(',', $data[$imageAttr]);
             $assets = $this->assetRepository?->whereIn('id', $ids)?->get()?->toArray();
             foreach ($assets ?? [] as $asset) {
-                $imageKey = $imageAttr.'_'.$asset['id'];
+                $imageKey = $imageAttr . '_' . $asset['id'];
                 $assetAttrCode[] = $imageKey;
                 if ($asset['mime_type'] == 'video/mp4') {
                     $videoInstance = $this->videoAddToShopify($asset, $data['sku'], $medias, $imageKey, $updateMedia);
@@ -1921,10 +2238,10 @@ class Exporter extends AbstractExporter
                 ];
             }
 
-            $filePath = base_path('storage/app/private/'.$asset['path']);
+            $filePath = base_path('storage/app/private/' . $asset['path']);
 
             if (! file_exists($filePath) || ! is_readable($filePath)) {
-                throw new \Exception('File does not exist or not Readable at path: '.$filePath);
+                throw new \Exception('File does not exist or not Readable at path: ' . $filePath);
             }
 
             $multipart[] = [
@@ -2024,7 +2341,7 @@ class Exporter extends AbstractExporter
             $ids = explode(',', $data[$imageAttr]);
             $assets = $this->assetRepository?->whereIn('id', $ids)?->get()?->toArray();
             foreach ($assets ?? [] as $asset) {
-                $imageAttrKey = $imageAttr.'_'.$asset['id'];
+                $imageAttrKey = $imageAttr . '_' . $asset['id'];
                 if ($asset['mime_type'] == 'video/mp4') {
                     $videoInstance = $this->videoAddToShopify($asset, $data['sku'], $medias, $imageAttrKey, $updateMedia);
                     if (! empty($videoInstance)) {
@@ -2127,7 +2444,7 @@ class Exporter extends AbstractExporter
         }
         foreach ($imageData as $key => $image) {
             $image = str_replace(' ', '%20', $image);
-            $galleryImageAttribute = $imageAttr.'_'.$key;
+            $galleryImageAttribute = $imageAttr . '_' . $key;
             $fullUrl = Storage::url($image);
             $mappingImage = $this->checkMappingInDbForImage($galleryImageAttribute, 'productImage', $itemData['sku']);
             if (! empty($mappingImage)) {

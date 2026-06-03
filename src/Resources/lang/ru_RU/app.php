@@ -2,13 +2,15 @@
 
 return [
     'tracker' => [
+        'batch' => 'Batch',
         'phase' => [
-            'product' => 'Product Exporting',
+            'product' => 'Product Creation',
             'publishing' => 'Publishing Products',
-            'collections' => 'Collection Assigning',
-            'translations' => 'Translation Adding',
+            'collections' => 'Collection Assignment',
+            'translations' => 'Translation',
+            'translations_collections' => 'Translation / Collection Assignment',
             'inventory' => 'Inventory Updating',
-            'media' => 'Uploading Media',
+            'media' => 'Media Upload',
         ],
     ],
     'exporters' => [
