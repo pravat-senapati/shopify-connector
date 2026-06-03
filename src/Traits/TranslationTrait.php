@@ -40,7 +40,7 @@ trait TranslationTrait
                     'id' => $addedMetaField['node']['id'],
                     'translations' => [],
                 ];
-                $namespaceKey = $addedMetaField['node']['namespace'] . '.' . $addedMetaField['node']['key'];
+                $namespaceKey = $addedMetaField['node']['namespace'].'.'.$addedMetaField['node']['key'];
 
                 foreach ($storeloacleMapping as $shopifyLocaleCode => $unopimLocaleCode) {
                     if ($shopifyDefaultLocale == $unopimLocaleCode || empty($namespaceKeys[$namespaceKey])) {
@@ -58,7 +58,7 @@ trait TranslationTrait
                             if (is_array($value2)) {
                                 continue;
                             }
-                            $jsonData = '{ "' . $key . '": "' . $value2 . '" }';
+                            $jsonData = '{ "'.$key.'": "'.$value2.'" }';
                         }
                     }
 
@@ -286,7 +286,7 @@ trait TranslationTrait
                 ];
             }
 
-            if (!empty($formatedVariable['translations'])) {
+            if (! empty($formatedVariable['translations'])) {
                 $this->requestGraphQlApiAction('createTranslation', $credentialAsArray, $formatedVariable);
             }
         }

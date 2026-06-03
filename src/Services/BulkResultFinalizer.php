@@ -28,9 +28,9 @@ class BulkResultFinalizer
      * Finalize a completed Shopify bulk operation by syncing local mappings or phase results.
      *
      * @param  bool  $dispatchFollowUps  When false, the core finalizer syncs mappings
-     *                                    but does NOT dispatch the follow-up phase jobs.
-     *                                    The synchronous per-batch exporter pipeline runs
-     *                                    those phases itself, in order, so it opts out here.
+     *                                   but does NOT dispatch the follow-up phase jobs.
+     *                                   The synchronous per-batch exporter pipeline runs
+     *                                   those phases itself, in order, so it opts out here.
      */
     public function finalize(object $bulkOperation, array $manifest, bool $dispatchFollowUps = true): void
     {

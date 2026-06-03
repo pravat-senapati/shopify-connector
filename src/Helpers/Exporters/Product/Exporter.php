@@ -88,11 +88,11 @@ class Exporter extends AbstractExporter
      * processed (core + every phase) before the next batch begins.
      */
     protected array $batchPhasePipeline = [
-        'inventory'    => InventoryPhaseService::class,
-        'publishing'   => PublishingPhaseService::class,
-        'collections'  => CollectionAssignmentPhaseService::class,
+        'inventory' => InventoryPhaseService::class,
+        'publishing' => PublishingPhaseService::class,
+        'collections' => CollectionAssignmentPhaseService::class,
         'translations' => TranslationPhaseService::class,
-        'media'        => MediaPhaseService::class,
+        'media' => MediaPhaseService::class,
     ];
 
     /**
@@ -120,12 +120,12 @@ class Exporter extends AbstractExporter
      * 'collections' and 'translations' share step 4 so they count once.
      */
     protected array $phaseProgressSteps = [
-        'product'      => 1,
-        'inventory'    => 2,
-        'publishing'   => 3,
-        'collections'  => 4,
+        'product' => 1,
+        'inventory' => 2,
+        'publishing' => 3,
+        'collections' => 4,
         'translations' => 4,
-        'media'        => 5,
+        'media' => 5,
     ];
 
     /**
@@ -363,7 +363,7 @@ class Exporter extends AbstractExporter
      */
     protected function exportCoreProductsInBulk(JobTrackBatchContract $batch): void
     {
-        $lockKey = 'shopify-core-bulk-pipeline-' . $this->export->id;
+        $lockKey = 'shopify-core-bulk-pipeline-'.$this->export->id;
 
         // TTL must comfortably exceed a single batch pipeline; block() waits for
         // our turn while another batch holds the lock.
@@ -434,7 +434,7 @@ class Exporter extends AbstractExporter
         $this->currentBatchNumber = $this->resolveBatchNumber($batch);
         $this->markBatchPhase('product');
 
-        $payload = $this->coreProductBulkPayloadBuilder->build($this->getFilters(), $this->getAllCoreBatchRows($batch), $this->export->id);
+        $payload = $this->coreProductBulkPayloadBuilder->build($this->getFilters(), $this->getAllCoreBatchRows($batch), $this->export);
         // Do NOT seed batch summary with the builder's line count — that's
         // "submitted to Shopify", not "accepted by Shopify". For a 10k-product
         // bulk op the gap is minutes, during which the UI would show 10000 as
@@ -449,8 +449,8 @@ class Exporter extends AbstractExporter
         }
 
         $basePath = sprintf('shopify/bulk/%s/%s', $this->export->id, $batch->id);
-        $jsonlPath = $basePath . '/input.jsonl';
-        $manifestPath = $basePath . '/manifest.json';
+        $jsonlPath = $basePath.'/input.jsonl';
+        $manifestPath = $basePath.'/manifest.json';
         $jsonlFileName = sprintf('shopify-products-%s-%s.jsonl', $this->export->id, $batch->id);
 
         $jsonlAbsolutePath = $this->bulkOperationService->writeJsonl($jsonlPath, $payload['lines']);
@@ -644,13 +644,13 @@ class Exporter extends AbstractExporter
             $status = strtoupper((string) ($operationState['status'] ?? ''));
 
             $update = [
-                'shopify_status'   => strtolower($operationState['status'] ?? 'unknown'),
-                'error_code'       => $operationState['errorCode'] ?? null,
-                'result_url'       => $operationState['url'] ?? null,
+                'shopify_status' => strtolower($operationState['status'] ?? 'unknown'),
+                'error_code' => $operationState['errorCode'] ?? null,
+                'result_url' => $operationState['url'] ?? null,
                 'partial_data_url' => $operationState['partialDataUrl'] ?? null,
-                'object_count'     => isset($operationState['objectCount']) ? (int) $operationState['objectCount'] : null,
-                'file_size'        => isset($operationState['fileSize']) ? (int) $operationState['fileSize'] : null,
-                'status'           => $this->mapBulkOperationStatus($status),
+                'object_count' => isset($operationState['objectCount']) ? (int) $operationState['objectCount'] : null,
+                'file_size' => isset($operationState['fileSize']) ? (int) $operationState['fileSize'] : null,
+                'status' => $this->mapBulkOperationStatus($status),
             ];
 
             if (in_array($status, ['COMPLETED', 'FAILED', 'CANCELED'], true)) {
@@ -697,9 +697,9 @@ class Exporter extends AbstractExporter
     {
         return match ($status) {
             'COMPLETED' => 'completed',
-            'FAILED'    => 'failed',
-            'CANCELED'  => 'cancelled',
-            default     => 'running',
+            'FAILED' => 'failed',
+            'CANCELED' => 'cancelled',
+            default => 'running',
         };
     }
 
@@ -782,7 +782,7 @@ class Exporter extends AbstractExporter
             });
 
         return $query->get()
-            ->map(fn($row) => ['sku' => $row->sku])
+            ->map(fn ($row) => ['sku' => $row->sku])
             ->all();
     }
 
@@ -1147,7 +1147,7 @@ class Exporter extends AbstractExporter
      * */
     public function updateSalesChannelPublishing(string $productId, array $existingPublicationId, array $publicationsIds, array $credential): void
     {
-        $existingIds = array_map(fn($item) => $item['node']['publication']['id'], $existingPublicationId);
+        $existingIds = array_map(fn ($item) => $item['node']['publication']['id'], $existingPublicationId);
         $newIds = array_column($publicationsIds, 'publicationId');
         sort($existingIds);
         sort($newIds);
@@ -1159,7 +1159,7 @@ class Exporter extends AbstractExporter
             $this->requestGraphQlApiAction('productPublish', $credential, ['input' => $productPublishFormate]);
             $removePublication = array_values(array_diff($existingIds, $newIds));
             if (! empty($removePublication)) {
-                $removePublicationIds = array_map(fn($id) => ['publicationId' => $id], $removePublication);
+                $removePublicationIds = array_map(fn ($id) => ['publicationId' => $id], $removePublication);
                 $this->updateSalesChannelUnpublishing($productId, $removePublicationIds, $credential);
             }
         }
@@ -1706,7 +1706,7 @@ class Exporter extends AbstractExporter
             if (in_array('FILE_DOES_NOT_EXIST', $errorCode)) {
                 preg_match('/^File ids \[(.*?)\]/', $errors[0]['message'], $matches);
                 if (! empty($matches[1])) {
-                    $fileIds = json_decode('[' . $matches[1] . ']', true);
+                    $fileIds = json_decode('['.$matches[1].']', true);
                     $this->deleteProductMediaMapping($fileIds);
                 }
             }
@@ -1930,7 +1930,7 @@ class Exporter extends AbstractExporter
             $translationsOption = $optionvalues['translations'];
             $name = $optionvalues['code'];
             if (isset($this->settingMapping->mapping['option_name_label']) && $this->settingMapping->mapping['option_name_label']) {
-                $name = array_column(array_filter($translationsOption, fn($item) => $item['locale'] === $shopifyDefaultLocale), 'name')[0] ?? $optionvalues['name'];
+                $name = array_column(array_filter($translationsOption, fn ($item) => $item['locale'] === $shopifyDefaultLocale), 'name')[0] ?? $optionvalues['name'];
             }
 
             if (! array_key_exists($optionvalues['code'], $mergedFields)) {
@@ -2179,7 +2179,7 @@ class Exporter extends AbstractExporter
             $ids = explode(',', $data[$imageAttr]);
             $assets = $this->assetRepository?->whereIn('id', $ids)?->get()?->toArray();
             foreach ($assets ?? [] as $asset) {
-                $imageKey = $imageAttr . '_' . $asset['id'];
+                $imageKey = $imageAttr.'_'.$asset['id'];
                 $assetAttrCode[] = $imageKey;
                 if ($asset['mime_type'] == 'video/mp4') {
                     $videoInstance = $this->videoAddToShopify($asset, $data['sku'], $medias, $imageKey, $updateMedia);
@@ -2238,10 +2238,10 @@ class Exporter extends AbstractExporter
                 ];
             }
 
-            $filePath = base_path('storage/app/private/' . $asset['path']);
+            $filePath = base_path('storage/app/private/'.$asset['path']);
 
             if (! file_exists($filePath) || ! is_readable($filePath)) {
-                throw new \Exception('File does not exist or not Readable at path: ' . $filePath);
+                throw new \Exception('File does not exist or not Readable at path: '.$filePath);
             }
 
             $multipart[] = [
@@ -2341,7 +2341,7 @@ class Exporter extends AbstractExporter
             $ids = explode(',', $data[$imageAttr]);
             $assets = $this->assetRepository?->whereIn('id', $ids)?->get()?->toArray();
             foreach ($assets ?? [] as $asset) {
-                $imageAttrKey = $imageAttr . '_' . $asset['id'];
+                $imageAttrKey = $imageAttr.'_'.$asset['id'];
                 if ($asset['mime_type'] == 'video/mp4') {
                     $videoInstance = $this->videoAddToShopify($asset, $data['sku'], $medias, $imageAttrKey, $updateMedia);
                     if (! empty($videoInstance)) {
@@ -2444,7 +2444,7 @@ class Exporter extends AbstractExporter
         }
         foreach ($imageData as $key => $image) {
             $image = str_replace(' ', '%20', $image);
-            $galleryImageAttribute = $imageAttr . '_' . $key;
+            $galleryImageAttribute = $imageAttr.'_'.$key;
             $fullUrl = Storage::url($image);
             $mappingImage = $this->checkMappingInDbForImage($galleryImageAttribute, 'productImage', $itemData['sku']);
             if (! empty($mappingImage)) {
