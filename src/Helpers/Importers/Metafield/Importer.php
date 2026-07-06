@@ -53,6 +53,8 @@ class Importer extends AbstractImporter
         'weight' => 'text',
         'volume' => 'text',
         'date' => 'date',
+        'file_reference' => 'image',
+        'link' => 'text',
     ];
 
     protected $numberType = ['number_integer', 'dimension', 'weight', 'volume'];
@@ -217,6 +219,14 @@ class Importer extends AbstractImporter
 
         foreach ($attributes as $attribute) {
             $metafieldType = $attribute['node']['type']['name'];
+            $baseType = preg_replace('/^list\./', '', $metafieldType);
+
+            if (in_array($baseType, ['product_reference', 'variant_reference', 'collection_reference'], true)) {
+                $this->persistDefinitionIfMissing($attribute);
+
+                continue;
+            }
+
             if (! isset($this->attributeType[$metafieldType])) {
                 continue;
             }
@@ -236,22 +246,40 @@ class Importer extends AbstractImporter
                 $attributeFormate['validation'] = 'decimal';
             }
 
-            $data = $this->formatDataForMetafield($attribute);
-
-            $existing = $this->shopifyMetaFieldRepository
-                ->findOneWhere([
-                    ['name_space_key', '=', $data['name_space_key']],
-                    ['ownerType', '=', $data['ownerType']],
-                ]);
-
-            if (! $existing) {
-                $this->shopifyMetaFieldRepository->create($data);
+            if ($metafieldType === 'file_reference') {
+                $fileTypes = (string) (collect($attribute['node']['validations'] ?? [])
+                    ->firstWhere('name', 'file_type_options')['value'] ?? '');
+                $attributeFormate['type'] = (str_contains($fileTypes, 'Image') && ! str_contains($fileTypes, 'Video'))
+                    ? 'image'
+                    : 'file';
             }
+
+            $this->persistDefinitionIfMissing($attribute);
 
             $attributesArray[] = $attributeFormate;
         }
 
         return $attributesArray;
+    }
+
+    private function persistDefinitionIfMissing(array $attribute): void
+    {
+        $data = $this->formatDataForMetafield($attribute);
+
+        $existing = $this->shopifyMetaFieldRepository->findOneWhere([
+            ['name_space_key', '=', $data['name_space_key']],
+            ['ownerType', '=', $data['ownerType']],
+        ]);
+
+        if (! $existing) {
+            $this->shopifyMetaFieldRepository->create($data);
+
+            return;
+        }
+
+        if (array_key_exists('taxonomy_category', $data)) {
+            $this->shopifyMetaFieldRepository->update(['taxonomy_category' => $data['taxonomy_category']], $existing->id);
+        }
     }
 
     public function formatDataForMetafield(array $metafieldDefinition): array
@@ -282,6 +310,34 @@ class Importer extends AbstractImporter
                 'min' => (string) $scaleMin,
                 'max' => (string) $scaleMax,
             ]);
+        }
+
+        if (str_contains($typeName, 'file_reference')) {
+            $fileTypes = (string) (collect($node['validations'] ?? [])
+                ->firstWhere('name', 'file_type_options')['value'] ?? '');
+            $contentType = str_contains($fileTypes, 'Image') ? 'IMAGE'
+                : (str_contains($fileTypes, 'Video') ? 'VIDEO' : 'FILE');
+
+            $data['validations'] = json_encode(['content_type' => $contentType]);
+        }
+
+        $referenceBase = preg_replace('/^list\./', '', $typeName);
+        if (in_array($referenceBase, ['product_reference', 'variant_reference', 'collection_reference'], true)) {
+            $data['type'] = $referenceBase;
+            $associationType = in_array($node['key'], ['up_sells', 'cross_sells'], true) ? $node['key'] : 'related_products';
+            $data['validations'] = json_encode($referenceBase === 'collection_reference'
+                ? ['reference_source' => 'categories']
+                : ['reference_source' => 'association', 'association_type' => $associationType,
+                    'reference_as' => $referenceBase === 'variant_reference' ? 'variant' : 'product']);
+        }
+
+        if (array_key_exists('constraints', $node)) {
+            $data['taxonomy_category'] = (($node['constraints']['key'] ?? null) === 'category')
+                ? array_map(
+                    fn ($value) => 'gid://shopify/TaxonomyCategory/'.$value['value'],
+                    $node['constraints']['values']['nodes'] ?? []
+                )
+                : [];
         }
 
         return $data;

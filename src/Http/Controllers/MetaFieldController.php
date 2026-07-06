@@ -10,6 +10,7 @@ use Webkul\Shopify\DataGrids\Catalog\MetaFieldDataGrid;
 use Webkul\Shopify\Helpers\ShoifyMetaFieldType;
 use Webkul\Shopify\Http\Requests\MetaFieldForm;
 use Webkul\Shopify\Repositories\ShopifyMetaFieldRepository;
+use Webkul\Shopify\Services\Taxonomy\ShopifyTaxonomyLoader;
 
 class MetaFieldController extends Controller
 {
@@ -80,6 +81,11 @@ class MetaFieldController extends Controller
     public function store(MetaFieldForm $request): JsonResponse
     {
         $data = $request->all();
+
+        if (array_key_exists('taxonomy_category', $data)) {
+            $data['taxonomy_category'] = $this->decodeTaxonomyCategory($data['taxonomy_category']);
+        }
+
         $nameSpaceAndKey = ! empty($data['name_space_key']) ? explode('.', $data['name_space_key'], 2) : [];
 
         if (count($nameSpaceAndKey) === 2) {
@@ -90,6 +96,16 @@ class MetaFieldController extends Controller
         $data['ContentTypeName'] = $data['ContentTypeName'] ?? ($data['type'] ?? '');
         $data['ownerTypeName'] = $data['ownerTypeName'] ?? ($data['ownerType'] ?? '');
         $data['attributeLabel'] = $data['attributeLabel'] ?? ($data['attribute'] ?? '');
+
+        $referenceMode = $request->boolean('reference_mode');
+        if ($referenceMode) {
+            $resolvedType = $data['type'] ?? 'list.product_reference';
+            $data['listvalue'] = str_starts_with($resolvedType, 'list.') ? 1 : 0;
+            $data['type'] = preg_replace('/^list\./', '', $resolvedType);
+            $nsKey = explode('.', $data['name_space_key'] ?? '', 2);
+            $data['code'] = $nsKey[1] ?? ($data['name_space_key'] ?? $data['type']);
+        }
+
         $errors = [];
         if ((bool) $data['pin']) {
             $allPined = $this->shopifyMetaFieldRepository->where('pin', 1)->where('ownerType', $data['ownerType'])->get()->toArray();
@@ -98,10 +114,12 @@ class MetaFieldController extends Controller
             }
         }
 
-        $attributeCode = $this->shopifyMetaFieldRepository->where('code', $data['code'])->where('ownerType', $data['ownerType'])->get()->first();
-        if ($attributeCode) {
-            $defintionType = ($attributeCode?->ownerType == 'PRODUCT') ? 'Product Definition' : 'Product variant Definition';
-            $errors['code'] = [trans('Definition already created in '.$defintionType)];
+        if (! $referenceMode) {
+            $attributeCode = $this->shopifyMetaFieldRepository->where('code', $data['code'])->where('ownerType', $data['ownerType'])->get()->first();
+            if ($attributeCode) {
+                $defintionType = ($attributeCode?->ownerType == 'PRODUCT') ? 'Product Definition' : 'Product variant Definition';
+                $errors['code'] = [trans('Definition already created in '.$defintionType)];
+            }
         }
         if (isset($data['name_space_key'])) {
             $nameSpaceAndKeyExist = $this->shopifyMetaFieldRepository->where('name_space_key', $data['name_space_key'])
@@ -146,6 +164,21 @@ class MetaFieldController extends Controller
         if (! empty($data['maxunit']) || ! empty($data['minunit'])) {
             $validationValue['maxunit'] = ! empty($data['maxunit']) ? $data['maxunit'] : null;
             $validationValue['minunit'] = ! empty($data['minunit']) ? $data['minunit'] : null;
+        }
+
+        if (($data['type'] ?? null) === 'file_reference' && ! empty($data['content_type'])) {
+            $validationValue['content_type'] = $data['content_type'];
+        }
+
+        if ($referenceMode) {
+            $source = $data['reference_source'] ?? 'association';
+            $validationValue['reference_source'] = $source;
+            if ($source === 'association') {
+                $validationValue['association_type'] = $data['association_type'] ?? 'related_products';
+                $validationValue['reference_as'] = $data['reference_as'] ?? 'product';
+            }
+        } elseif (($data['type'] ?? null) === 'link' && ! empty($data['link_text_attribute'])) {
+            $validationValue['link_text_attribute'] = $data['link_text_attribute'];
         }
 
         if (! empty($validationValue)) {
@@ -284,7 +317,24 @@ class MetaFieldController extends Controller
         $metaFieldType = $object->getMetaFieldType();
         $metaFieldTypeInShopify = $object->getMetaFieldTypeInShopify();
 
-        return view('shopify::metafield.edit', compact('metaField', 'metaFieldType', 'metaFieldTypeInShopify'));
+        $taxonomyOptions = [];
+        $saved = (array) ($metaField->taxonomy_category ?? []);
+        if ($saved !== []) {
+            $names = app(ShopifyTaxonomyLoader::class)->namesFor($saved);
+            foreach ($saved as $gid) {
+                $taxonomyOptions[] = ['id' => $gid, 'label' => $names[$gid] ?? $gid];
+            }
+        }
+
+        $linkTextAttribute = '';
+        if ($metaField->type === 'link') {
+            $validations = is_string($metaField->validations)
+                ? (json_decode($metaField->validations, true) ?: [])
+                : (array) $metaField->validations;
+            $linkTextAttribute = $validations['link_text_attribute'] ?? '';
+        }
+
+        return view('shopify::metafield.edit', compact('metaField', 'metaFieldType', 'metaFieldTypeInShopify', 'taxonomyOptions', 'linkTextAttribute'));
     }
 
     /**
@@ -295,6 +345,20 @@ class MetaFieldController extends Controller
     public function update(int $id)
     {
         $requestData = request()->except(['_token', '_method', 'listvalue']);
+
+        if (array_key_exists('taxonomy_category', $requestData)) {
+            $requestData['taxonomy_category'] = $this->decodeTaxonomyCategory($requestData['taxonomy_category']);
+        }
+
+        $referenceMode = request()->boolean('reference_mode');
+        if ($referenceMode) {
+            $resolvedType = $requestData['type'] ?? 'list.product_reference';
+            $requestData['listvalue'] = str_starts_with($resolvedType, 'list.') ? 1 : 0;
+            $requestData['type'] = preg_replace('/^list\./', '', $resolvedType);
+            $nsKey = explode('.', $requestData['name_space_key'] ?? '', 2);
+            $requestData['code'] = $nsKey[1] ?? ($requestData['name_space_key'] ?? $requestData['type']);
+        }
+
         $errors = [];
         if ((bool) $requestData['pin']) {
             $allPined = $this->shopifyMetaFieldRepository->where('pin', 1)->where('ownerType', $requestData['ownerType'])->get()->toArray();
@@ -325,6 +389,21 @@ class MetaFieldController extends Controller
                 $validationValue['maxunit'] = ! empty($requestData['maxunit']) ? $requestData['maxunit'] : null;
                 $validationValue['minunit'] = ! empty($requestData['minunit']) ? $requestData['minunit'] : null;
             }
+        }
+
+        if (($requestData['type'] ?? null) === 'file_reference' && ! empty($requestData['content_type'])) {
+            $validationValue['content_type'] = $requestData['content_type'];
+        }
+
+        if ($referenceMode) {
+            $source = $requestData['reference_source'] ?? 'association';
+            $validationValue['reference_source'] = $source;
+            if ($source === 'association') {
+                $validationValue['association_type'] = $requestData['association_type'] ?? 'related_products';
+                $validationValue['reference_as'] = $requestData['reference_as'] ?? 'product';
+            }
+        } elseif (($requestData['type'] ?? null) === 'link' && ! empty($requestData['link_text_attribute'])) {
+            $validationValue['link_text_attribute'] = $requestData['link_text_attribute'];
         }
 
         if (! empty($validationValue)) {
@@ -369,6 +448,11 @@ class MetaFieldController extends Controller
         session()->flash('success', trans('shopify::app.shopify.metafield.update-success'));
 
         return redirect()->route('shopify.metafield.edit', $id);
+    }
+
+    private function decodeTaxonomyCategory(mixed $value): array
+    {
+        return is_string($value) ? (json_decode($value, true) ?: []) : (array) $value;
     }
 
     /**

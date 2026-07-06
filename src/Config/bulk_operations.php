@@ -5,13 +5,15 @@ return [
     'dispatch_followup_phases' => true,
 
     /*
-    | Core export path selection. Bulk Operations have a large fixed latency
-    | (async submit + poll + sequential follow-up phases) that dominates for
-    | small catalogs — a single product can take ~30s. Below this many product
-    | rows (roots + variants) the export falls back to the direct per-product
-    | GraphQL path, which has near-zero fixed cost. At or above it, bulk wins on throughput.
+    | Max seconds the synchronous, batch-scoped export pipeline waits WITHOUT
+    | observing any progress from a single Shopify bulk operation (core or phase)
+    | before giving up on it. This is an idle/no-progress cap, NOT a cap on total
+    | runtime: a large single batch can run for hours and still complete — as long
+    | as Shopify keeps advancing (status changing or objectCount climbing) we keep
+    | waiting, so the follow-up phases still fire. The cap only trips for a
+    | genuinely stuck op, which must not hold the per-export batch lock forever.
     */
-    'bulk_threshold' => env('SHOPIFY_EXPORT_BULK_THRESHOLD', 5),
+    'sync_pipeline_max_wait_seconds' => 1800,
 
     /*
     | Import-side bulk-operation tuning. The product importer can fetch the

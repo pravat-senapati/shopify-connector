@@ -2,7 +2,6 @@
 
 namespace Webkul\Shopify\Services;
 
-use Webkul\Shopify\Jobs\RunMediaPhase;
 use Webkul\Shopify\Jobs\RunPublishingPhase;
 use Webkul\Shopify\Jobs\RunTranslationPhase;
 use Webkul\Shopify\Models\ShopifyBulkOperation;
@@ -43,8 +42,9 @@ class PhaseOrchestrator
             PhaseProgressTracker::PHASES_PER_BATCH,
         );
 
+        // Media is synchronized through the productSet mutation in the core
+        // phase, so no separate media bulk operation is dispatched here.
         RunPublishingPhase::dispatch($bulkOperation->id);
         RunTranslationPhase::dispatch($bulkOperation->id);
-        RunMediaPhase::dispatch($bulkOperation->id);
     }
 }

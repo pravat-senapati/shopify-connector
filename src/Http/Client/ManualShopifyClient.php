@@ -44,6 +44,12 @@ class ManualShopifyClient implements ShopifyClient
 
         $apiClient = new GraphQLApiClient($credential['shopUrl'], $credential['accessToken'], $credential['apiVersion']);
 
+        if ($operation == 'customQuery') {
+
+            $apiClient->setCustom($variables['query']);
+            $variables = $variables['variables'] ?? [];
+        }
+
         $response = $apiClient->request($operation, $variables);
 
         if (

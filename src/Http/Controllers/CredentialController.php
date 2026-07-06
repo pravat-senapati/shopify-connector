@@ -339,7 +339,6 @@ class CredentialController extends Controller
             $response = $this->requestGraphQlApiAction('getShopPublishedLocales', $credentialData);
             $publishing = $this->requestGraphQlApiAction('getPublications', $credentialData);
             $locationGetting = $this->requestGraphQlApiAction('getignLocations', $credentialData);
-
             $locationAll = $locationGetting['body']['data']['locations']['edges'] ?? [];
             $publishingChannel = $publishing['body']['data']['publications']['edges'] ?? [];
             $shopLocales = $response['body']['data']['shopLocales'] ?? [];
@@ -455,14 +454,13 @@ class CredentialController extends Controller
 
         $extras = is_array($credential->extras) ? $credential->extras : [];
 
-        $extras['locations'] = $requestData['locations'] ?? null;
-
         $extras['salesChannel'] = $requestData['salesChannel'] ?? null;
+        $extras['locationAttributeMappings'] = $requestData['locationAttributeMappings'];
 
         $requestData['extras'] = $extras;
 
         unset($requestData['salesChannel']);
-        unset($requestData['locations']);
+        unset($requestData['locationAttributeMappings']);
 
         $this->shopifyRepository->update($requestData, $id);
 

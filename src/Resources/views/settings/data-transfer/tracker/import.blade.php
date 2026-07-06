@@ -525,7 +525,7 @@
                                     <p class="font-semibold text-green-700 dark:text-green-300" v-if="jobInstance.type == 'import'">@lang('admin::app.settings.data-transfer.imports.import.importing-info')</p>
                                     <p class="font-semibold text-green-700 dark:text-green-300" v-if="jobInstance.type == 'export'">@{{ exportingHeadline }}</p>
                                     <p class="text-sm text-green-600/80 dark:text-green-400/80 mt-0.5" v-if="jobInstance.type == 'import'">@lang('admin::app.settings.data-transfer.imports.import.importing-info-sub')</p>
-                                    <p class="text-sm text-green-600/80 dark:text-green-400/80 mt-0.5" v-if="jobInstance.type == 'export'">@lang('admin::app.settings.data-transfer.imports.import.exporting-info-sub')</p>
+                                    <p class="text-sm text-green-600/80 dark:text-green-400/80 mt-0.5" v-if="jobInstance.type == 'export'">@lang('admin::app.settings.data-transfer.imports.import.exporting-info-sub')<template v-if="currentPhaseObjectCount !== null"> &middot; @{{ Number(currentPhaseObjectCount).toLocaleString() }} @lang('shopify::app.tracker.objects-processed')</template></p>
                                 </div>
                             </div>
                             <div class="flex gap-2 items-center flex-shrink-0 ml-4">
@@ -564,10 +564,10 @@
                                 <template v-if="jobInstance.type == 'import'">@lang('admin::app.settings.data-transfer.tracker.import-progress')</template>
                                 <template v-else>@lang('admin::app.settings.data-transfer.tracker.export-progress')</template>
                             </span>
-                            <span class="text-sm font-bold text-green-600 dark:text-green-400">@{{ stats.progress }}%</span>
+                            <span class="text-sm font-bold text-green-600 dark:text-green-400">@{{ displayProgress }}%</span>
                         </div>
                         <div class="w-full bg-green-100 dark:bg-green-900/40 rounded-full h-2.5">
-                            <div class="bg-green-600 h-2.5 rounded-full transition-all duration-500" :style="{ 'width': stats.progress + '%' }"></div>
+                            <div class="bg-green-600 h-2.5 rounded-full transition-all duration-500" :style="{ 'width': displayProgress + '%' }"></div>
                         </div>
                     </div>
 
@@ -1000,13 +1000,15 @@
 
         @php
             $shopifyPhaseLabels = [
-                'product'      => trans('shopify::app.tracker.phase.product'),
-                'publishing'   => trans('shopify::app.tracker.phase.publishing'),
-                'translations' => trans('shopify::app.tracker.phase.translations'),
-                'media'        => trans('shopify::app.tracker.phase.media'),
+                'formatting'               => trans('shopify::app.tracker.phase.formatting'),
+                'product'                  => trans('shopify::app.tracker.phase.product'),
+                'publishing'               => trans('shopify::app.tracker.phase.publishing'),
+                'translations'             => trans('shopify::app.tracker.phase.translations_collections'),
+                'media'                    => trans('shopify::app.tracker.phase.media'),
             ];
             $shopifyDefaultExportInfo = trans('admin::app.settings.data-transfer.imports.import.exporting-info');
             $shopifyDefaultExportStep = trans('admin::app.settings.data-transfer.imports.import.pending-step-export');
+            $shopifyBatchWord = trans('shopify::app.tracker.batch');
         @endphp
 
         <script type="module">
@@ -1030,19 +1032,71 @@
                         phaseLabels: @json($shopifyPhaseLabels),
                         defaultExportInfo: @json($shopifyDefaultExportInfo),
                         defaultExportStep: @json($shopifyDefaultExportStep),
+                        batchWord: @json($shopifyBatchWord),
                     };
                 },
 
                 computed: {
                     currentPhaseLabel() {
                         const phase = this.importResource?.summary?.current_phase;
-                        return phase ? (this.phaseLabels[phase] ?? null) : null;
+                        const label = phase ? (this.phaseLabels[phase] ?? null) : null;
+
+                        if (! label) {
+                            return null;
+                        }
+
+                        // Prefix with the active batch ordinal: "Batch 5 - Inventory Updating".
+                        const batch = this.importResource?.summary?.current_batch;
+
+                        return batch ? `${this.batchWord} ${batch} - ${label}` : label;
+                    },
+                    currentPhaseObjectCount() {
+                        const phase = this.importResource?.summary?.current_phase;
+                        const counts = this.importResource?.summary?.phase_object_counts;
+
+                        if (! phase || ! counts) {
+                            return null;
+                        }
+
+                        const count = counts[phase];
+
+                        return (count === undefined || count === null) ? null : Number(count);
+                    },
+                    phaseObjectCounts() {
+                        // Per-phase object counts written live by the Shopify export
+                        // pipeline, ordered by the known phase sequence so the UI lists
+                        // them consistently while the bulk operations run.
+                        const counts = this.importResource?.summary?.phase_object_counts;
+
+                        if (! counts) {
+                            return [];
+                        }
+
+                        return Object.keys(this.phaseLabels)
+                            .filter(phase => counts[phase] !== undefined && counts[phase] !== null)
+                            .map(phase => ({
+                                phase,
+                                label: this.phaseLabels[phase],
+                                count: Number(counts[phase]),
+                            }));
                     },
                     exportingHeadline() {
                         return this.currentPhaseLabel || this.defaultExportInfo;
                     },
                     exportingFooterLabel() {
                         return this.currentPhaseLabel || this.defaultExportStep;
+                    },
+                    displayProgress() {
+                        // Prefer the per-phase progress written by the Shopify export
+                        // pipeline (each phase advances the bar, even with one batch);
+                        // fall back to the server batch-completion stat otherwise.
+                        const phaseProgress = this.importResource?.summary?.phase_progress;
+
+                        if (phaseProgress !== undefined && phaseProgress !== null) {
+                            return Number(phaseProgress);
+                        }
+
+                        return Number(this.stats?.progress ?? 0);
                     },
                 },
 
@@ -1081,7 +1135,7 @@
                     },
 
                     formattedETA() {
-                        const progress = parseFloat(this.stats.progress);
+                        const progress = parseFloat(this.displayProgress);
                         if (!progress || progress <= 0 || progress >= 100 || !this.workStartedAt) return '—';
                         const workElapsed = (Date.now() - this.workStartedAt) / 1000;
                         if (workElapsed < 2) return '—';

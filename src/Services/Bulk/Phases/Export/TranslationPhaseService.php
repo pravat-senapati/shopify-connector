@@ -27,9 +27,9 @@ class TranslationPhaseService extends BasePhaseService
     {
         $storeLocaleMapping = $this->credential->storelocaleMapping ?? [];
         $storeLocales = $this->credential->storeLocales ?? [];
-
+        $isTranslation = count(array_filter($storeLocaleMapping));
         // Only proceed if multiple locales are configured (i.e., translations are needed)
-        if (count($storeLocaleMapping) < 2) {
+        if ($isTranslation < 2) {
             return [];
         }
 

@@ -89,6 +89,7 @@ class SaasProxyClient implements ShopifyClient
             'method' => 'POST',
             'field' => 'stagedUploadsCreate',
         ],
+
         'bulkOperationRunMutation' => [
             'path' => '/graphql/api/bulkOperationRunMutation.json',
             'method' => 'POST',
@@ -135,12 +136,20 @@ class SaasProxyClient implements ShopifyClient
             'method' => 'GET',
             'connection' => 'collections',
             'defaults' => ['first' => 10],
+            'override' => ['fields' => 'id,title,handle,descriptionHtml,seo{title,description},image{id,url},ruleSet{appliedDisjunctively},updatedAt,sortOrder,templateSuffix,productsCount{count,precision}'],
         ],
         'GetCollectionsByCursor' => [
             'path' => '/graphql/api/collections.json',
             'method' => 'GET',
             'connection' => 'collections',
             'rename' => ['afterCursor' => 'after'],
+            'override' => ['fields' => 'id,title,handle,descriptionHtml,seo{title,description},image{id,url},ruleSet{appliedDisjunctively},updatedAt,sortOrder,templateSuffix,productsCount{count,precision}'],
+        ],
+
+        'customQuery' => [
+            'path' => '/graphql/api/products.json',
+            'method' => 'GET',
+            'connection' => 'product',
         ],
 
         // --- Attribute / Family import ------------------------------------
@@ -196,7 +205,11 @@ class SaasProxyClient implements ShopifyClient
             'path' => '/graphql/api/metafieldDefinitions.json',
             'method' => 'GET',
             'connection' => 'metafieldDefinitions',
-            'override' => ['first' => 250, 'ownerType' => 'PRODUCT'],
+            'override' => [
+                'first' => 250,
+                'ownerType' => 'PRODUCT',
+                'fields' => 'id namespace key name ownerType pinnedPosition type { name } validations { name type value } constraints { key values(first: 250) { nodes { value } } }',
+            ],
         ],
         'metafieldDefinitionsProductVariantType' => [
             'path' => '/graphql/api/metafieldDefinitions.json',
@@ -406,6 +419,14 @@ class SaasProxyClient implements ShopifyClient
                 ->retry(3, 100);
 
             if ($definition['method'] === 'GET') {
+                if ($operation == 'customQuery') {
+                    $variables = [
+                        'id' => $variables['variables']['id'],
+                        'fields' => $variables['query'],
+                    ];
+                    // $response = $request->get($url, $this->buildProxyQuery($variables, $definition));
+                    // dd($response->json());
+                }
                 $response = $request->get($url, $this->buildProxyQuery($variables, $definition));
             } else {
                 $response = $request->send($definition['method'], $url, [
@@ -426,6 +447,18 @@ class SaasProxyClient implements ShopifyClient
             // Paginated list reads (import iterators) are reshaped into the
             // Shopify GraphQL connection envelope; single results pass through.
             if (isset($definition['connection'])) {
+                if ($operation == 'customQuery') {
+                    // dd($json);
+                    return [
+                        'code' => $response->status(),
+                        'body' => [
+                            'data' => [
+                                'product' => $json['products']['nodes'][0] ?? null,
+                            ],
+                        ],
+                    ];
+                }
+
                 return [
                     'code' => $response->status(),
                     'body' => [

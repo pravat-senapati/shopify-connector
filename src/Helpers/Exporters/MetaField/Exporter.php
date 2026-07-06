@@ -53,6 +53,8 @@ class Exporter extends AbstractExporter
 
     protected bool $exportsFile = false;
 
+    protected ?array $currentConstraintsMap = null;
+
     /**
      * Create a new instance of the exporter.
      */
@@ -286,6 +288,9 @@ class Exporter extends AbstractExporter
             $minunit = $validationDatas['minunit'] ?? null;
             unset($validationDatas['maxunit'], $validationDatas['minunit']);
             foreach ($validationDatas as $key => $validationData) {
+                if (in_array($key, ['content_type', 'reference_source', 'association_type', 'reference_as', 'link_text_attribute'], true)) {
+                    continue;
+                }
                 if ($validationData == null) {
                     continue;
                 }
@@ -326,10 +331,87 @@ class Exporter extends AbstractExporter
                 }
             }
 
-            $formattedData['capabilities'] = $capabilities;
+            if (! empty($capabilities)) {
+                $formattedData['capabilities'] = $capabilities;
+            }
+        }
+
+        $desired = array_values(array_filter(array_map(
+            fn ($gid) => substr((string) $gid, strrpos((string) $gid, '/') + 1),
+            (array) ($rowData['taxonomy_category'] ?? [])
+        )));
+
+        if ($desired !== []) {
+            $formattedData['pin'] = false;
+        }
+
+        if (! $id && $desired !== []) {
+            $formattedData['constraints'] = ['key' => 'category', 'values' => $desired];
+        } elseif ($id) {
+            $current = $this->fetchCurrentCategoryConstraint($rowData);
+            $toCreate = array_values(array_diff($desired, $current));
+            $toDelete = array_values(array_diff($current, $desired));
+
+            if ($toCreate !== [] || $toDelete !== []) {
+                $values = array_merge(
+                    array_map(fn ($v) => ['create' => $v], $toCreate),
+                    array_map(fn ($v) => ['delete' => $v], $toDelete)
+                );
+
+                $formattedData['constraintsUpdates'] = ['key' => 'category', 'values' => $values];
+            }
         }
 
         return $formattedData;
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function fetchCurrentCategoryConstraint(array $rowData): array
+    {
+        return $this->currentCategoryConstraints()[$rowData['name_space_key'] ?? ''] ?? [];
+    }
+
+    /**
+     * @return array<string, array<int, string>>
+     */
+    private function currentCategoryConstraints(): array
+    {
+        if ($this->currentConstraintsMap !== null) {
+            return $this->currentConstraintsMap;
+        }
+
+        $map = [];
+        $cursor = null;
+
+        do {
+            $response = $this->requestGraphQlApiAction('metafieldDefinitionsProductType', $this->credentialArray, [
+                'first' => 250,
+                'after' => $cursor,
+            ]);
+
+            $edges = $response['body']['data']['metafieldDefinitions']['edges'] ?? [];
+
+            foreach ($edges as $edge) {
+                $node = $edge['node'] ?? [];
+                $nsKey = ($node['namespace'] ?? '').'.'.($node['key'] ?? '');
+
+                if (($node['constraints']['key'] ?? null) === 'category') {
+                    $map[$nsKey] = array_map(fn ($v) => $v['value'], $node['constraints']['values']['nodes'] ?? []);
+                }
+            }
+
+            $lastCursor = ! empty($edges) ? end($edges)['cursor'] : null;
+
+            if ($cursor === $lastCursor || empty($lastCursor)) {
+                break;
+            }
+
+            $cursor = $lastCursor;
+        } while (! empty($edges));
+
+        return $this->currentConstraintsMap = $map;
     }
 
     /**

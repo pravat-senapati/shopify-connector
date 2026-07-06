@@ -35,6 +35,16 @@ abstract class BasePhaseService
 {
     use ShopifyGraphqlRequest;
 
+    /**
+     * Whether handle() should dispatch the async PollBulkShopifyOperation job
+     * for the phase bulk operation it creates.
+     *
+     * The async Run*Phase jobs leave this true (fire-and-forget polling). The
+     * synchronous, batch-scoped exporter pipeline sets it to false so it can
+     * poll the phase operation inline and keep the per-batch phase order strict.
+     */
+    public bool $dispatchPollJob = true;
+
     /** @var ShopifyCredential|null */
     protected $credential;
 
@@ -85,7 +95,7 @@ abstract class BasePhaseService
 
         // Build payload lines (JSONL)
         $lines = $this->buildPayloadLines($operationData);
-
+        // dump($lines);
         if (empty($lines)) {
             return ['processed' => 0, 'errors' => [], 'phase_bulk_operation_id' => null];
         }
@@ -147,8 +157,6 @@ abstract class BasePhaseService
         if (! $shopifyBulkOperationId) {
             $message = $response['userErrors'][0]['message'] ?? 'Unknown error';
 
-            // A sibling phase still holds the single bulk-mutation slot. Signal
-            // the calling job to release & retry rather than dropping the phase.
             if (stripos($message, 'already in progress') !== false) {
                 throw new BulkMutationInProgressException($message);
             }
@@ -176,8 +184,9 @@ abstract class BasePhaseService
             ],
         ]);
 
-        // Dispatch poll job
-        PollBulkShopifyOperation::dispatch($phaseBulkOperation->id);
+        if ($this->dispatchPollJob) {
+            PollBulkShopifyOperation::dispatch($phaseBulkOperation->id);
+        }
 
         return [
             'processed' => count($lines),

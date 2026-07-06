@@ -4,6 +4,7 @@ namespace Webkul\Shopify\Services;
 
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use Psr\Log\LoggerInterface;
 use Webkul\DataTransfer\Models\JobTrackProxy;
 use Webkul\DataTransfer\Repositories\JobTrackBatchRepository;
 use Webkul\DataTransfer\Repositories\JobTrackRepository;
@@ -16,6 +17,10 @@ class BulkResultFinalizer
 {
     use ShopifyGraphqlRequest;
 
+    protected const MEDIA_HASH_ENTITY_TYPE = 'productMediaHash';
+
+    protected ?LoggerInterface $jobLogger = null;
+
     public function __construct(
         protected ShopifyMappingRepository $shopifyMappingRepository,
         protected PhaseOrchestrator $phaseOrchestrator,
@@ -26,8 +31,13 @@ class BulkResultFinalizer
 
     /**
      * Finalize a completed Shopify bulk operation by syncing local mappings or phase results.
+     *
+     * @param  bool  $dispatchFollowUps  When false, the core finalizer syncs mappings
+     *                                   but does NOT dispatch the follow-up phase jobs.
+     *                                   The synchronous per-batch exporter pipeline runs
+     *                                   those phases itself, in order, so it opts out here.
      */
-    public function finalize(object $bulkOperation, array $manifest): void
+    public function finalize(object $bulkOperation, array $manifest, bool $dispatchFollowUps = true): void
     {
         $resultPath = $bulkOperation->result_file_path;
 
@@ -42,17 +52,31 @@ class BulkResultFinalizer
 
         // For core product sync (phase = 'core_product_sync' or empty), perform mapping sync and dispatch follow-up phases
         if (empty($phase) || $phase === BulkOperationService::CORE_PRODUCT_PHASE) {
-            $this->finalizeCoreProductSync($bulkOperation, $manifest, $results);
+            $this->finalizeCoreProductSync($bulkOperation, $manifest, $results, $dispatchFollowUps);
         } else {
             $this->finalizePhaseOperation($bulkOperation, $manifest, $results);
+        }
+    }
+
+    protected function makeJobLogger(?int $jobTrackId): ?LoggerInterface
+    {
+        if (! $jobTrackId) {
+            return null;
+        }
+
+        try {
+            return JobLogger::make($jobTrackId);
+        } catch (\Throwable $e) {
+            return null;
         }
     }
 
     /**
      * Finalize core productSet bulk operation: sync product/variant mappings.
      */
-    protected function finalizeCoreProductSync(ShopifyBulkOperation $bulkOperation, array $manifest, array $results): void
+    protected function finalizeCoreProductSync(ShopifyBulkOperation $bulkOperation, array $manifest, array $results, bool $dispatchFollowUps = true): void
     {
+        $this->jobLogger = $this->makeJobLogger($bulkOperation->job_track_id ?? null);
         $manifestLines = $manifest['lines'] ?? [];
         $shopUrl = $manifest['shop_url'] ?? null;
         $credential = $manifest['credential'] ?? [];
@@ -62,7 +86,6 @@ class BulkResultFinalizer
         $failed = [];
         $clearedStaleSkus = [];
         $recreatedSkus = [];
-
         foreach ($results as $index => $line) {
             $decoded = json_decode($line, true);
             $manifestLine = $manifestLines[$index] ?? [];
@@ -72,7 +95,6 @@ class BulkResultFinalizer
 
             if (! empty($userErrors) || empty($product['id'])) {
                 $sku = $manifestLine['product_sku'] ?? null;
-
                 if ($sku && $shopUrl && $this->isStaleProductMappingError($userErrors)) {
                     $cleared = $this->clearStaleProductMappings($sku, $shopUrl);
                     if (! empty($cleared)) {
@@ -104,6 +126,11 @@ class BulkResultFinalizer
                     'sku' => $sku,
                     'errors' => $userErrors,
                 ];
+                $this->jobLogger?->info(sprintf(
+                    'Warning product Export sku %s is %s.',
+                    $sku,
+                    json_encode($userErrors, true),
+                ));
 
                 continue;
             }
@@ -129,6 +156,10 @@ class BulkResultFinalizer
                 );
             }
 
+            if (! empty($inputLines[$index]['input']['files'])) {
+                $this->syncMediaHashes($manifestLine, $product['id'], $jobTrackId, $shopUrl);
+            }
+
             $success++;
         }
 
@@ -151,9 +182,15 @@ class BulkResultFinalizer
 
         $this->markBatchProcessed($bulkOperation, $success, count($failed));
 
-        // Dispatch follow-up phases
+        // Persist the follow-up context regardless; it is read by the phase services.
         $this->phaseOrchestrator->registerPendingPhases($bulkOperation, $manifest['follow_up_context'] ?? []);
-        $this->phaseOrchestrator->dispatchPendingPhases($bulkOperation);
+
+        // Dispatch follow-up phases asynchronously only when the caller asks for it.
+        // The synchronous per-batch exporter pipeline runs the phases itself, in
+        // strict order, so it passes $dispatchFollowUps = false here.
+        if ($dispatchFollowUps) {
+            $this->phaseOrchestrator->dispatchPendingPhases($bulkOperation);
+        }
     }
 
     /**
@@ -247,6 +284,30 @@ class BulkResultFinalizer
         }
 
         $variables['identifier'] = ['handle' => $handle];
+        if (! empty($manifestLine['product_media'])) {
+            $media = collect($manifestLine['product_media'])
+                ->map(function ($item) {
+                    $item['originalSource'] = $item['url'];
+                    unset($item['url'], $item['path']);
+
+                    return $item;
+                })
+                ->values()
+                ->all();
+
+            $variables['input']['files'] = $media;
+        }
+
+        $filedVariant = array_values(array_filter($manifestLine['variant_file']));
+        if (! empty($filedVariant)) {
+            foreach ($variables['input']['variants'] as $index => &$variant) {
+                if (isset($filedVariant[$index])) {
+                    $variant['file'] = $filedVariant[$index]['file'];
+                }
+            }
+
+            unset($variant);
+        }
 
         try {
             $response = $this->requestGraphQlApiAction('productSet', $credential, $variables);
@@ -281,6 +342,10 @@ class BulkResultFinalizer
                 $jobTrackId,
                 $shopUrl,
             );
+        }
+
+        if (! empty($variables['input']['files'])) {
+            $this->syncMediaHashes($manifestLine, $product['id'], $jobTrackId, $shopUrl);
         }
 
         return ['success' => true];
@@ -388,7 +453,6 @@ class BulkResultFinalizer
                 'created' => $success,
                 'skipped' => $failed,
             ]);
-
             $this->jobTrackRepository->update(['summary' => $summary], $jobTrackId);
         });
     }
@@ -463,7 +527,6 @@ class BulkResultFinalizer
         $bulkOperation->meta = $meta;
         $bulkOperation->save();
 
-        // Persist the created Shopify media IDs so subsequent exports update the
         // existing media instead of creating duplicates.
         if ($mutation === 'productCreateMedia') {
             $this->persistMediaMappings($manifest, $results);
@@ -684,8 +747,80 @@ class BulkResultFinalizer
     }
 
     /**
-     * Create or update a media mapping row (entityType "productImage").
+     * Sync media hashes for a successfully exported product.
+     *
+     * Stores the image content hashes for the product's media so that subsequent
+     * exports can detect whether the media has changed and needs re-exporting.
+     * This is called only after the productSet mutation succeeds.
+     *
+     * @param  array  $manifestLine  The manifest line containing product_media
+     * @param  string  $productId  The Shopify product ID (GID)
+     * @param  int|null  $jobTrackId  The job track instance ID
+     * @param  string|null  $shopUrl  The Shopify shop URL
      */
+    protected function syncMediaHashes(array $manifestLine, string $productId, ?int $jobTrackId, ?string $shopUrl): void
+    {
+        $productSku = $manifestLine['product_sku'] ?? null;
+        $media = $manifestLine['product_media'] ?? [];
+
+        if (empty($productSku) || empty($media) || empty($shopUrl) || empty($jobTrackId)) {
+            return;
+        }
+
+        $imageHashes = array_map(fn ($item) => $this->imageContentHash($item['path'] ?? ''), $media);
+
+        $this->shopifyMappingRepository->deleteWhere([
+            'entityType' => self::MEDIA_HASH_ENTITY_TYPE,
+            'relatedSource' => $productSku,
+            'apiUrl' => $shopUrl,
+        ]);
+
+        $records = [];
+        foreach ($imageHashes as $hash) {
+            if ($hash === '') {
+                continue;
+            }
+
+            $records[] = [
+                'entityType' => self::MEDIA_HASH_ENTITY_TYPE,
+                'code' => $hash,
+                'relatedSource' => $productSku,
+                'relatedId' => $productId,
+                'jobInstanceId' => $jobTrackId,
+                'apiUrl' => $shopUrl,
+            ];
+        }
+
+        if (! empty($records)) {
+            $this->shopifyMappingRepository->insert($records);
+        }
+    }
+
+    /**
+     * Hash the raw content of a single image.
+     *
+     * The actual file bytes are hashed so any change to the image content yields a
+     * different hash. When the file cannot be read (e.g. remote/missing), the
+     * normalized storage path is hashed as a stable fallback so a changed
+     * reference still produces a different hash.
+     */
+    protected function imageContentHash(string $path): string
+    {
+        if ($path === '') {
+            return '';
+        }
+
+        try {
+            if (Storage::exists($path)) {
+                return hash('sha256', (string) Storage::get($path));
+            }
+        } catch (\Throwable $e) {
+            // Unreadable disk — fall back to the path below.
+        }
+
+        return hash('sha256', $path);
+    }
+
     protected function syncMediaMapping(?string $sku, ?string $code, ?string $mediaId, ?string $productId, ?int $jobTrackId, ?string $shopUrl): void
     {
         if (! $sku || ! $code || ! $mediaId || ! $jobTrackId || ! $shopUrl) {

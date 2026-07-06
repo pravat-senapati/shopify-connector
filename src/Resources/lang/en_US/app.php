@@ -2,13 +2,17 @@
 
 return [
     'tracker' => [
+        'batch' => 'Batch',
+        'objects-processed' => 'Objects Processed',
         'phase' => [
-            'product' => 'Product Exporting',
+            'formatting' => 'Formatting Product',
+            'product' => 'Product Creation',
             'publishing' => 'Publishing Products',
-            'collections' => 'Collection Assigning',
-            'translations' => 'Translation Adding',
+            'collections' => 'Collection Assignment',
+            'translations' => 'Translation',
+            'translations_collections' => 'Translation / Collection Assignment',
             'inventory' => 'Inventory Updating',
-            'media' => 'Uploading Media',
+            'media' => 'Media Upload',
         ],
     ],
     'exporters' => [
@@ -34,6 +38,7 @@ return [
                 'shopify' => 'Shopify',
                 'credentials' => 'Credentials',
                 'export-mappings' => 'Export Mappings',
+                'collection-mappings' => 'Collection Mappings',
                 'import-mappings' => 'Import Mappings',
                 'meta-fields' => 'Metafield Definitions',
                 'settings' => 'Settings',
@@ -58,7 +63,11 @@ return [
         ],
 
         'version' => 'Version: 1.0.0',
-
+        'attribute' => [
+            'taxonomy-type' => 'Shopify Taxonomy',
+            'taxonomy-select-placeholder' => 'Select a category',
+            'only-one' => 'Only one Shopify Taxonomy attribute is allowed.',
+        ],
         'credential' => [
             'export' => [
                 'locales' => 'Locale Mapping',
@@ -99,6 +108,9 @@ return [
                 'back-btn' => 'Back',
                 'channel' => 'Publishing (Sales channels)',
                 'locations' => 'Location List',
+                'location_inventory_title' => 'Location-wise Inventory',
+                'location_inventory_info' => 'Map a quantity attribute for each location to send location-wise stock. Locations left blank are skipped.',
+                'location_inventory_attribute' => 'Quantity Attribute',
             ],
             'edit' => [
                 'title' => 'Edit Credential',
@@ -123,6 +135,20 @@ return [
             'revoke-failed' => 'Could not revoke the Shopify connection. Please try again.',
             'secure-login-failed' => 'Secure login link is invalid or expired. Please sign in manually.',
             'saas-readonly-note' => 'This is a SaaS Shopify connection. Connection details are read-only — you can only configure the Publishing (Sales channels), Location and Locale mapping below.',
+            'install' => [
+                'title' => 'Install Shopify App',
+                'client_id' => 'Client ID',
+                'client_id_placeholder' => 'Enter your Shopify API Key',
+                'client_secret' => 'Client Secret',
+                'client_secret_placeholder' => 'Enter your Shopify API Secret',
+                'continue' => 'Continue to Shopify',
+                'missing_parameters' => 'The install request is missing required parameters.',
+                'stale_request' => 'The install request has expired. Please try again.',
+                'auth_code_received' => 'Authorization code received. Finishing installation…',
+                'missing_credentials' => 'Client ID and Client Secret are required.',
+                'token_exchange_failed' => 'Failed to exchange authorization code for access token. Please try again.',
+                'missing_access_token' => 'Shopify did not return a valid access token.',
+            ],
         ],
         'export' => [
             'mapping' => [
@@ -137,6 +163,10 @@ return [
                 'attribute' => 'UnoPim Attribute',
                 'fixed-value' => 'Fixed Value',
                 'save_failed' => 'Export mapping save failed. Please run the Shopify install command.',
+                'validation' => [
+                    'name_required' => 'Please map an attribute or set a fixed value for Name.',
+                    'status_required' => 'Please select a product status.',
+                ],
                 'images' => [
                     'title' => 'Shopify Media Mapping',
                     'label' => [
@@ -150,6 +180,82 @@ return [
                     'weight' => 'Unit Weight',
                     'volume' => 'Unit Volume',
                     'dimension' => 'Unit Dimension',
+                ],
+
+                'status' => [
+                    'title' => 'Product Status',
+                    'label' => 'Shopify Status',
+                    'placeholder' => 'Select product status',
+                    'tooltip' => 'Applies to all exported products.',
+                    'options' => [
+                        'active' => 'Active',
+                        'draft' => 'Draft',
+                        'archived' => 'Archived',
+                        'unlisted' => 'Unlisted',
+                    ],
+                ],
+
+                'unit_price' => [
+                    'title' => 'Unit Price',
+                    'quantity_value' => 'Total amount',
+                    'quantity_unit' => 'Total amount unit',
+                    'quantity_value_info' => 'Choose a number or decimal type attribute.',
+                    'quantity_unit_info' => 'Choose a text or select type attribute. Its value must match a valid unit (e.g. :units); other values are not exported.',
+                    'reference_value' => 'Base measure',
+                    'reference_unit' => 'Base measure unit',
+                    'auto' => 'Auto (same as total amount unit)',
+                ],
+
+                'tabs' => [
+                    'general' => 'General',
+                    'taxonomy' => 'Category Taxonomy',
+                ],
+
+                'taxonomy' => [
+                    'title' => 'Category Taxonomy Mapping',
+                    'header_category' => 'UnoPim Category',
+                    'header_taxonomy' => 'Shopify Taxonomy',
+                    'category_placeholder' => 'Select category',
+                    'taxonomy_placeholder' => 'Search Shopify taxonomy',
+                    'add_btn' => 'Add',
+                    'save_btn' => 'Save',
+                    'saved' => 'Category taxonomy mapping saved successfully',
+                    'save_failed' => 'Failed to save category taxonomy mapping',
+                    'empty' => 'No mappings yet. Add one below.',
+                    'already_mapped' => 'This category is already mapped',
+                ],
+
+                'collection' => [
+                    'title' => 'Collection Mappings',
+                    'back-btn' => 'Back',
+                    'save' => 'Save',
+                    'created' => 'Collection Mapping saved successfully',
+                    'save_failed' => 'Collection mapping save failed. Please run the Shopify install command.',
+                    'validation' => [
+                        'title_required' => 'Please map a category attribute for Title.',
+                    ],
+                    'errors' => [
+                        'empty_title' => 'Skipping collection for category :code: the mapped Title attribute is empty.',
+                    ],
+                    'images' => [
+                        'title' => 'Collection Image Mapping',
+                        'label' => 'Image Attribute',
+                    ],
+                    'sort_order' => [
+                        'label' => 'Product Sort Order',
+                        'placeholder' => 'Select sort order',
+                        'tooltip' => 'Applies to all exported collections.',
+                        'options' => [
+                            'manual' => 'Manual',
+                            'best_selling' => 'Best Selling',
+                            'alpha_asc' => 'Alphabetical (A-Z)',
+                            'alpha_desc' => 'Alphabetical (Z-A)',
+                            'price_asc' => 'Price (low to high)',
+                            'price_desc' => 'Price (high to low)',
+                            'created' => 'Date created (oldest first)',
+                            'created_desc' => 'Date created (newest first)',
+                        ],
+                    ],
                 ],
             ],
 
@@ -236,6 +342,7 @@ return [
             'seo_title' => 'SEO Title',
             'seo_description' => 'SEO Description',
             'handle' => 'Handle',
+            'collection_type' => 'Collection Type',
             'taxable' => 'Taxable',
             'inventory_cost' => 'Cost per item',
 
@@ -246,6 +353,13 @@ return [
             'channel' => 'Channel',
             'currency' => 'Currency',
             'productfilter' => 'Product Filter (SKU)',
+            'status' => 'Status',
+            'enable' => 'Enable',
+            'disable' => 'Disable',
+            'active' => 'Active',
+            'draft' => 'Draft',
+            'archived' => 'Archived',
+            'unlisted' => 'Unlisted',
             'locale' => 'Locale',
             'attribute-groups' => 'Attribute Groups',
         ],
@@ -255,6 +369,9 @@ return [
                 'attribute-label' => 'Unopim Attribute',
                 'definitionName' => 'Definition name',
                 'contentTypeName' => 'Type',
+                'product-reference' => 'Product Reference',
+                'variant-reference' => 'Product Variant Reference',
+                'collection-reference' => 'Collection Reference',
                 'pin' => 'Pin',
             ],
             'index' => [
@@ -275,6 +392,29 @@ return [
                 'adminFilterable' => 'Filtering for products',
                 'smartCollectionCondition' => 'Smart collections',
                 'storefronts' => 'Storefronts access',
+                'reference' => 'Reference',
+                'reference-source' => 'Reference source',
+                'association' => 'Association',
+                'association-type' => 'Association type',
+                'categories' => 'Categories',
+                'reference-as' => 'Reference as',
+                'as-product' => 'Product',
+                'as-variant' => 'Variant',
+                'as-collection' => 'Collection',
+                'related' => 'Related',
+                'up-sells' => 'Up-sells',
+                'cross-sells' => 'Cross-sells',
+                'resolved-type' => 'Type',
+                'anchor-text' => 'Anchor text',
+                'taxonomy-category' => 'Taxonomy Category',
+                'taxonomy-assign' => 'Assign categories',
+                'taxonomy-edit' => 'Edit',
+                'taxonomy-search' => 'Search',
+                'taxonomy-root' => 'All',
+                'taxonomy-loading' => 'Loading…',
+                'taxonomy-selected' => 'selected',
+                'taxonomy-cancel' => 'Cancel',
+                'taxonomy-done' => 'Done',
                 'unit' => [
                     'minvalue' => '',
                     'maxvalue' => '',
@@ -295,7 +435,14 @@ return [
                 'dimension' => 'Dimension',
                 'weight' => 'Weight',
                 'volume' => 'Volume',
+                'email' => 'Email',
+                'image_file' => 'Image (File)',
+                'file' => 'File',
+                'video' => 'Video (File)',
+                'link' => 'Link',
             ],
+
+            'content-type' => 'File Content Type',
 
             'edit' => [
                 'title' => 'Edit Metafield Definition',

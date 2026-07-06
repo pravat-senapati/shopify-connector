@@ -79,6 +79,106 @@ class PhaseProgressTracker
     }
 
     /**
+     * UI hint: record the active batch ordinal together with the phase currently
+     * executing for it, so the tracker can show "Batch N - <phase>" in real time.
+     *
+     * Writes to JobTrack.summary (current_batch + current_phase). Both the async
+     * phase jobs (via markStarted) and the synchronous per-batch exporter pipeline
+     * feed this; the tracker UI polls JobTrack.summary every second.
+     */
+    public function markBatchPhaseStarted(?int $jobTrackId, ?int $batchNumber, string $phase, ?float $progress = null): void
+    {
+        if (! $jobTrackId) {
+            return;
+        }
+
+        DB::transaction(function () use ($jobTrackId, $batchNumber, $phase, $progress) {
+            $jobTrack = $this->lockJobTrack($jobTrackId);
+
+            if (! $jobTrack) {
+                return;
+            }
+
+            $summary = $jobTrack->summary ?? [];
+            $summary['current_phase'] = $phase;
+
+            if ($batchNumber !== null) {
+                $summary['current_batch'] = $batchNumber;
+            }
+
+            // Overall progress, distributed evenly across batches and the five
+            // phases within each batch, so the tracker bar advances per phase.
+            if ($progress !== null) {
+                $summary['phase_progress'] = $progress;
+            }
+
+            $this->jobTrackRepository->update(['summary' => $summary], $jobTrackId);
+        });
+    }
+
+    /**
+     * UI hint: record the number of objects Shopify reports processed so far for
+     * a given phase of the active export, so the tracker can show a live object
+     * count per phase ("Media Upload · 1,234 objects") while the bulk operation
+     * is still running.
+     *
+     * Stored as a phase => count map under summary.phase_object_counts. Null
+     * counts (Shopify has not reported one yet) are ignored so an earlier good
+     * value is never clobbered. Best-effort, mirroring markBatchPhaseStarted.
+     */
+    public function recordPhaseObjectCount(?int $jobTrackId, string $phase, ?int $objectCount): void
+    {
+        if (! $jobTrackId || $objectCount === null) {
+            return;
+        }
+
+        DB::transaction(function () use ($jobTrackId, $phase, $objectCount) {
+            $jobTrack = $this->lockJobTrack($jobTrackId);
+
+            if (! $jobTrack) {
+                return;
+            }
+
+            $summary = $jobTrack->summary ?? [];
+            $counts = $summary['phase_object_counts'] ?? [];
+            $counts[$phase] = $objectCount;
+            $summary['phase_object_counts'] = $counts;
+
+            $this->jobTrackRepository->update(['summary' => $summary], $jobTrackId);
+        });
+    }
+
+    /**
+     * Clear the per-phase object count map at the start of a new batch, so the
+     * tracker UI only ever shows counts for the batch currently being processed
+     * rather than accumulating completed phases from previous batches.
+     */
+    public function resetPhaseObjectCounts(?int $jobTrackId): void
+    {
+        if (! $jobTrackId) {
+            return;
+        }
+
+        DB::transaction(function () use ($jobTrackId) {
+            $jobTrack = $this->lockJobTrack($jobTrackId);
+
+            if (! $jobTrack) {
+                return;
+            }
+
+            $summary = $jobTrack->summary ?? [];
+
+            if (! array_key_exists('phase_object_counts', $summary)) {
+                return;
+            }
+
+            unset($summary['phase_object_counts']);
+
+            $this->jobTrackRepository->update(['summary' => $summary], $jobTrackId);
+        });
+    }
+
+    /**
      * Decrement a core op's counter when a phase work unit settles.
      *
      * If the JobTrack-wide total reaches zero AND no other core ops are still

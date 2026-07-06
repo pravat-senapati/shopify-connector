@@ -22,12 +22,15 @@ use Webkul\Product\Repositories\ProductRepository;
 use Webkul\Shopify\Helpers\Iterator\BulkOperationProductIterator;
 use Webkul\Shopify\Helpers\Iterator\ProductIterator;
 use Webkul\Shopify\Helpers\ShoifyMetaFieldType;
+use Webkul\Shopify\Helpers\ShopifyFields;
 use Webkul\Shopify\Jobs\DownloadShopifyImage;
 use Webkul\Shopify\Jobs\RefreshImportedProducts;
 use Webkul\Shopify\Repositories\ShopifyCredentialRepository;
 use Webkul\Shopify\Repositories\ShopifyExportMappingRepository;
 use Webkul\Shopify\Repositories\ShopifyMappingRepository;
+use Webkul\Shopify\Repositories\ShopifyMetaFieldRepository;
 use Webkul\Shopify\Services\Bulk\Import\BulkProductFetcher;
+use Webkul\Shopify\Services\ShopifyClientFactory;
 use Webkul\Shopify\Traits\DataMappingTrait;
 use Webkul\Shopify\Traits\ShopifyGraphqlRequest;
 use Webkul\Shopify\Traits\ValidatedBatched;
@@ -106,6 +109,11 @@ class Importer extends AbstractImporter
      */
     private $currency;
 
+    /**
+     * Optional Shopify product-status import filter: 'enable', 'disable', or null (all).
+     */
+    private ?string $statusFilter = null;
+
     protected $importMapping;
 
     protected $defintiionMapping;
@@ -144,6 +152,8 @@ class Importer extends AbstractImporter
     protected $productIndexes = ['title', 'handle', 'vendor', 'descriptionHtml', 'productType', 'tags'];
 
     protected $seoFields = ['metafields_global_title_tag', 'metafields_global_description_tag'];
+
+    protected ?string $taxonomyAttributeCode = null;
 
     protected $variantIndexes = ['inventoryPolicy', 'barcode', 'taxable', 'compareAtPrice', 'sku', 'inventoryTracked', 'cost', 'weight', 'price', 'inventoryQuantity'];
 
@@ -197,6 +207,7 @@ class Importer extends AbstractImporter
         protected FileStorer $fileStorer,
         protected CategoryRepository $categoryRepository,
         protected ShopifyMappingRepository $shopifyMappingRepository,
+        protected ShopifyMetaFieldRepository $shopifyMetaFieldRepository,
         protected ShoifyMetaFieldType $shoifyMetaFieldType,
     ) {
         parent::__construct($importBatchRepository);
@@ -212,6 +223,8 @@ class Importer extends AbstractImporter
         $this->attributeFamilies = $this->attributeFamilyRepository->all();
 
         $this->attributes = $this->attributeRepository->all()->keyBy('code');
+
+        $this->taxonomyAttributeCode = $this->attributes->firstWhere('type', 'shopify_taxonomy')?->code;
 
         $this->importMapping = $this->shopifyExportmapping->find(3);
 
@@ -287,6 +300,8 @@ class Importer extends AbstractImporter
 
         $this->currency = $filters['currency'] ?? null;
 
+        $this->statusFilter = $filters['status'] ?? null;
+
         $this->credentialArray = $this->credential?->toApiArray() ?? [];
 
         $this->defintiionMapping = array_merge(array_keys($this->credential?->extras['productMetafield'] ?? []), array_keys($this->credential?->extras['productVariantMetafield'] ?? []));
@@ -299,6 +314,7 @@ class Importer extends AbstractImporter
      */
     public function getSource()
     {
+
         $this->initFilters();
         if (! $this->credential?->active) {
             throw new \InvalidArgumentException(trans('shopify::app.shopify.credential.errors.disabled-credential'));
@@ -312,6 +328,7 @@ class Importer extends AbstractImporter
                     app(BulkProductFetcher::class),
                     $this->credentialArray,
                     $this->shopifyLocale,
+                    $this->statusFilter,
                 );
             } catch (\Throwable $e) {
                 Log::warning(
@@ -442,8 +459,15 @@ class Importer extends AbstractImporter
 
             [$metaFieldCommon, $metaFieldLocaleSpecific, $metaFieldChannelSpecific, $metaFieldChannelAndLocaleSpecific] = $this->mapMetafieldsAttribute($rowData['node']['metafields']['edges'] ?? [], $metaFieldAllAttr);
 
+            [$refAssociations, $refLinkAttrs] = $this->resolveReferenceLinkMetafields($rowData['node']['metafields']['edges'] ?? []);
+            $metaFieldCommon = array_merge($metaFieldCommon, $refLinkAttrs);
+
             $common = array_merge($productCommon, $seoCommon, $metaFieldCommon);
             $common['status'] = $rowData['node']['status'] == 'ACTIVE' ? 'true' : 'false';
+            $taxonomyCategory = $rowData['node']['category']['id'] ?? null;
+            if ($this->taxonomyAttributeCode && $taxonomyCategory) {
+                $common[$this->taxonomyAttributeCode] = $taxonomyCategory;
+            }
             $localeSpecific = array_merge($productLocaleSpecific, $seoLocaleSpecific, $metaFieldLocaleSpecific);
             $channelSpecific = array_merge($productChannelSpecific, $seoChannelSpecific, $metaFieldChannelSpecific);
             $channelAndLocaleSpecific = array_merge($productChannelAndLocaleSpecific, $seoChannelAndLocaleSpecific, $metaFieldChannelAndLocaleSpecific);
@@ -462,7 +486,8 @@ class Importer extends AbstractImporter
                     $channelAndLocaleSpecific,
                     $mediaMapping,
                     $extractVariantAttr,
-                    $metaFieldAllAttr
+                    $metaFieldAllAttr,
+                    $refAssociations
                 );
                 if (! $parentData) {
                     continue;
@@ -484,7 +509,8 @@ class Importer extends AbstractImporter
                     $metaFieldCommon,
                     $metaFieldChannelSpecific,
                     $metaFieldLocaleSpecific,
-                    $metaFieldChannelAndLocaleSpecific
+                    $metaFieldChannelAndLocaleSpecific,
+                    $refAssociations
                 );
 
                 if (! $childData) {
@@ -520,7 +546,8 @@ class Importer extends AbstractImporter
         $channelAndLocaleSpecific,
         $mediaMapping,
         $extractVariantAttr,
-        $metaFieldAllAttr
+        $metaFieldAllAttr,
+        $associations = []
     ) {
         $attributes = [];
         $storeForVariant = [];
@@ -629,6 +656,10 @@ class Importer extends AbstractImporter
             'variants' => $variantProductData,
             'categories' => $unopimCategory,
         ];
+
+        foreach ($associations as $assocKey => $assocSkus) {
+            $dataToUpdate[$assocKey] = $assocSkus;
+        }
 
         $product = $this->productRepository->update($dataToUpdate, $configId);
         $this->trackTouchedProduct($configId);
@@ -1017,7 +1048,8 @@ class Importer extends AbstractImporter
         $metaFieldCommon,
         $metaFieldChannelSpecific,
         $metaFieldLocaleSpecific,
-        $metaFieldChannelAndLocaleSpecific
+        $metaFieldChannelAndLocaleSpecific,
+        $associations = []
     ) {
         $shopifyProductId = $rowData['node']['id'];
         $storeForVariant = [];
@@ -1140,6 +1172,10 @@ class Importer extends AbstractImporter
             'categories' => $unopimCategory,
         ];
 
+        foreach ($associations as $assocKey => $assocSkus) {
+            $dataToUpdate[$assocKey] = $assocSkus;
+        }
+
         $product = $this->productRepository->update($dataToUpdate, $simpleId);
         $this->trackTouchedProduct($simpleId);
 
@@ -1154,6 +1190,73 @@ class Importer extends AbstractImporter
             'locale' => $this->locale,
             'channel' => $this->channel,
         ]);
+    }
+
+    /**
+     * @return array{0: array<string, array<int, string>>, 1: array<string, string>}
+     */
+    public function resolveReferenceLinkMetafields(array $metafieldEdges): array
+    {
+        $associations = [];
+        $linkAttrs = [];
+
+        foreach ($metafieldEdges as $edge) {
+            $node = $edge['node'] ?? [];
+            $nameSpaceKey = ($node['namespace'] ?? '').'.'.($node['key'] ?? '');
+
+            $definition = $this->shopifyMetaFieldRepository->findOneWhere([
+                ['name_space_key', '=', $nameSpaceKey],
+                ['ownerType', '=', 'PRODUCT'],
+            ]);
+
+            if (! $definition) {
+                continue;
+            }
+
+            $cfg = json_decode($definition->validations ?? '[]', true) ?: [];
+
+            if (in_array($definition->type, ['product_reference', 'variant_reference'], true)) {
+                $skus = $this->resolveReferenceSkus((string) ($node['value'] ?? ''));
+                if (! empty($skus)) {
+                    $section = $cfg['association_type'] ?? 'related_products';
+                    $associations[$section] = array_values(array_unique(
+                        array_merge($associations[$section] ?? [], $skus)
+                    ));
+                }
+            } elseif ($definition->type === 'link') {
+                $decoded = json_decode((string) ($node['value'] ?? ''), true) ?: [];
+                if (! empty($decoded['url'])) {
+                    $linkAttrs[$definition->code] = $decoded['url'];
+                }
+                $textAttr = $cfg['link_text_attribute'] ?? null;
+                if ($textAttr && isset($decoded['text'])) {
+                    $linkAttrs[$textAttr] = $decoded['text'];
+                }
+            }
+        }
+
+        return [$associations, $linkAttrs];
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function resolveReferenceSkus(string $value): array
+    {
+        $decoded = json_decode($value, true);
+        $gids = array_values(array_filter(is_array($decoded) ? $decoded : [$value]));
+        if (empty($gids)) {
+            return [];
+        }
+
+        $shopUrl = $this->credentialArray['shopUrl'] ?? null;
+
+        $byExternal = $this->shopifyMappingRepository->where('entityType', 'product')
+            ->where('apiUrl', $shopUrl)->whereIn('externalId', $gids)->pluck('code')->all();
+        $byRelated = $this->shopifyMappingRepository->where('entityType', 'product')
+            ->where('apiUrl', $shopUrl)->whereIn('relatedId', $gids)->pluck('code')->all();
+
+        return array_values(array_unique(array_merge($byExternal, $byRelated)));
     }
 
     public function mapMetafieldsAttribute($shopifyMetaFiled, $metaFieldAllAttr): array
@@ -1179,6 +1282,13 @@ class Importer extends AbstractImporter
                 $source = $unitValue['value'] ?? 0;
             }
 
+            if (str_contains((string) $metaData['node']['type'], 'file_reference')) {
+                $source = $this->resolveFileReferenceValue($metaData['node'], $unoAttr);
+                if ($source === null) {
+                    continue;
+                }
+            }
+
             if (! $attribute?->value_per_locale && ! $attribute?->value_per_channel) {
                 $common[$unoAttr] = $source;
             }
@@ -1202,6 +1312,95 @@ class Importer extends AbstractImporter
             $channelSpecific,
             $channelAndLocaleSpecific,
         ];
+    }
+
+    /**
+     * Resolve a file_reference metafield into stored UnoPim asset path(s) via the
+     * existing image fetch/queue pipeline. Prefers the file URL fetched inline in
+     * the bulk product query (`reference`) — that rides the proxy on SaaS too. Falls
+     * back to a direct getFileById lookup (manual transport only) when no inline
+     * reference is present. Returns null when nothing resolves.
+     */
+    private function resolveFileReferenceValue(array $metaNode, string $unoAttr): ?string
+    {
+        $urls = $this->fileReferenceUrlsInline($metaNode);
+
+        if (empty($urls)) {
+            if (! app(ShopifyClientFactory::class)->supportsFileReference($this->credentialArray)) {
+                $this->jobLogger->warning('File metafield import skipped — no inline reference and SaaS proxy file endpoints unavailable.');
+
+                return null;
+            }
+
+            $urls = $this->fileReferenceUrlsByIds((string) ($metaNode['value'] ?? ''));
+        }
+
+        if (empty($urls)) {
+            return null;
+        }
+
+        $path = 'product'.DIRECTORY_SEPARATOR.'metafield'.DIRECTORY_SEPARATOR.$unoAttr.DIRECTORY_SEPARATOR;
+        $stored = [];
+
+        foreach ($urls as $url) {
+            $resolved = $this->fetchOrQueueImage($url, $path);
+
+            if ($resolved) {
+                $stored[] = $resolved;
+            }
+        }
+
+        return empty($stored) ? null : implode(',', $stored);
+    }
+
+    /**
+     * File URL(s) from the metafield's inline `reference` (single) fetched in the
+     * bulk product query. Works on SaaS + manual since it needs no extra API call.
+     *
+     * @return array<int, string>
+     */
+    private function fileReferenceUrlsInline(array $metaNode): array
+    {
+        $reference = $metaNode['reference'] ?? null;
+
+        if (empty($reference) || ! is_array($reference)) {
+            return [];
+        }
+
+        $url = $reference['image']['url']
+            ?? $reference['url']
+            ?? ($reference['sources'][0]['url'] ?? null);
+
+        return $url ? [$url] : [];
+    }
+
+    /**
+     * Fallback GID → URL resolution via getFileById (manual transport only — the
+     * SaaS proxy does not expose this endpoint).
+     *
+     * @return array<int, string>
+     */
+    private function fileReferenceUrlsByIds(string $value): array
+    {
+        $decoded = json_decode($value, true);
+        $ids = array_values(array_filter(is_array($decoded) ? $decoded : [$value]));
+
+        if (empty($ids)) {
+            return [];
+        }
+
+        $response = $this->requestGraphQlApiAction('getFileById', $this->credentialArray, ['ids' => $ids]);
+        $nodes = $response['body']['data']['nodes'] ?? [];
+
+        $urls = [];
+        foreach ($nodes as $node) {
+            $url = $node['url'] ?? ($node['image']['url'] ?? null);
+            if ($url) {
+                $urls[] = $url;
+            }
+        }
+
+        return $urls;
     }
 
     public function updateBatchtate(JobTrackBatchContract $batch): void
@@ -1507,6 +1706,7 @@ class Importer extends AbstractImporter
             $optionForShopify = $this->findAttributeOptionCached($attribute, $optionvalue);
 
             if (! $optionForShopify) {
+
                 $this->jobLogger->warning("{$option['name']} - {$option['value']}:- Option is not found in the unopim sku:- {$variantData['node']['sku']}");
 
                 return null;
@@ -1568,6 +1768,41 @@ class Importer extends AbstractImporter
             }
 
             $classifyAttribute($attribute, $unoAttr, $value, $vcommon, $vlocale_specific, $vchannel_specific, $vchannelAndLocaleSpecific);
+        }
+
+        // Per-location inventory → mapped UnoPim attributes (reverse of export locationAttributeMappings).
+        $locationAttributeMappings = $this->credential?->extras['locationAttributeMappings'] ?? [];
+        foreach ($variantData['node']['inventoryItem']['inventoryLevels']['edges'] ?? [] as $levelEdge) {
+            $level = $levelEdge['node'] ?? [];
+            $locationId = $level['location']['id'] ?? null;
+            $attrCode = $locationId ? ($locationAttributeMappings[$locationId] ?? null) : null;
+
+            if (! $attrCode || ! isset($this->attributes[$attrCode])) {
+                continue;
+            }
+
+            $available = 0;
+            foreach ($level['quantities'] ?? [] as $quantity) {
+                if (($quantity['name'] ?? null) === 'available') {
+                    $available = $quantity['quantity'] ?? 0;
+                    break;
+                }
+            }
+
+            $classifyAttribute($this->attributes[$attrCode], $attrCode, (string) $available, $vcommon, $vlocale_specific, $vchannel_specific, $vchannelAndLocaleSpecific);
+        }
+
+        // Unit price (Shopify unitPriceMeasurement) → mapped UnoPim attributes (reverse of export).
+        $unitPrice = (new ShopifyFields)->extractUnitPriceFromVariant(
+            $variantData['node']['unitPriceMeasurement'] ?? null,
+            $this->importMapping->mapping['unit_price'] ?? []
+        );
+        foreach ($unitPrice as $attrCode => $value) {
+            if (! isset($this->attributes[$attrCode])) {
+                continue;
+            }
+
+            $classifyAttribute($this->attributes[$attrCode], $attrCode, $value, $vcommon, $vlocale_specific, $vchannel_specific, $vchannelAndLocaleSpecific);
         }
 
         $vcommon['sku'] = preg_replace('/[^A-Za-z0-9_-]/', '', $variantData['node']['sku']);
